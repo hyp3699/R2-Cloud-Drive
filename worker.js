@@ -3312,6 +3312,9 @@ async function runGithubSyncForSource(source, onFileProgress) {
   if (cur.length) batches.push(cur);
 
   const ghSleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  // Errors that waiting will never fix (file too large, not found, session
+  // gone): retrying them only wastes the user's time.
+  const ghIsPermanentError = (msg) => /超过 95MB|HTTP (400|403|404|410)\b|会话已过期|没有要同步/.test(String(msg || ''));
   const ghPostBatch = async (paths) => {
     const res = await fetch('/api/github-sync/batch', {
       method: 'POST', headers: jsonHeaders(),
@@ -3324,7 +3327,7 @@ async function runGithubSyncForSource(source, onFileProgress) {
   let failures = [];
   for (const batch of batches) {
     let { res, data } = await ghPostBatch(batch.map(f => f.path));
-    if (!res.ok || !data.ok) {
+    if ((!res.ok || !data.ok) && !ghIsPermanentError(data.error)) {
       // Whole-request failure (a quota spike or a network hiccup): wait and
       // retry this batch once before giving up on the whole sync.
       ghSetSourceStatus(source.id, '请求失败，15 秒后自动重试本批…');
@@ -3342,20 +3345,26 @@ async function runGithubSyncForSource(source, onFileProgress) {
   if (failures.length) {
     // Failures during a long sync are usually a throttling window (GitHub
     // or D1): waiting it out and retrying just the failed files rescues
-    // most syncs that would otherwise die a few hundred files in.
-    const firstErr = failures[0].error ? '（' + failures[0].error + '）' : '';
-    ghSetSourceStatus(source.id, failures.length + ' 个文件失败' + firstErr + '，30 秒后自动重试…');
-    await ghSleep(30000);
-    const retryPaths = failures.map(f => f.path);
-    failures = [];
-    for (let i = 0; i < retryPaths.length; i += 2) {
-      const chunk = retryPaths.slice(i, i + 2);
-      const { res, data } = await ghPostBatch(chunk);
-      if (!res.ok || !data.ok) { for (const p of chunk) failures.push({ path: p, error: data.error || '重试请求失败' }); continue; }
-      for (const r of (data.results || [])) if (!r.ok) failures.push(r);
-    }
-    if (failures.length) {
-      ghSetSourceStatus(source.id, '重试后仍有 ' + failures.length + ' 个文件失败，下次同步会继续重试');
+    // most syncs that would otherwise die a few hundred files in. Permanent
+    // failures (oversized, not found) skip the wait entirely.
+    const permanent = failures.filter(f => ghIsPermanentError(f.error));
+    const retryable = failures.filter(f => !ghIsPermanentError(f.error));
+    if (retryable.length) {
+      const firstErr = retryable[0].error ? '（' + retryable[0].error + '）' : '';
+      ghSetSourceStatus(source.id, retryable.length + ' 个文件失败' + firstErr + '，30 秒后自动重试…');
+      await ghSleep(30000);
+      const retryPaths = retryable.map(f => f.path);
+      const stillFailed = [];
+      for (let i = 0; i < retryPaths.length; i += 2) {
+        const chunk = retryPaths.slice(i, i + 2);
+        const { res, data } = await ghPostBatch(chunk);
+        if (!res.ok || !data.ok) { for (const p of chunk) stillFailed.push({ path: p, error: data.error || '重试请求失败' }); continue; }
+        for (const r of (data.results || [])) if (!r.ok) stillFailed.push(r);
+      }
+      failures = [...permanent, ...stillFailed];
+      if (stillFailed.length) {
+        ghSetSourceStatus(source.id, '重试后仍有 ' + stillFailed.length + ' 个文件失败，下次同步会继续重试');
+      }
     }
   }
 
@@ -5918,12 +5927,16 @@ async function cleanupStorageEntry(env, R2, entry) {
   await R2.delete(entry.storageKey);
 }
 
-async function replaceFileEntry(env, R2, entry, knownFolders = null) {
+async function replaceFileEntry(env, R2, entry, knownFolders = null, replacedSink = null) {
   const clean = assertVirtualPath(entry.path);
   const existing = await getFileEntry(env, clean);
   await putFileEntry(env, entry, knownFolders);
   if (existing && existing.storageKey !== entry.storageKey) {
-    await cleanupUnreferencedStorage(env, R2, existing);
+    // Callers writing many files per invocation (GitHub sync batches) pass
+    // a sink to collect replaced entries and clean them up with ONE shared
+    // reference scan, instead of one full scan per replaced file.
+    if (replacedSink) replacedSink.push(existing);
+    else await cleanupUnreferencedStorage(env, R2, existing);
   }
 }
 
@@ -7246,6 +7259,24 @@ async function githubSyncStorageKey(R2, virtualPath) {
   return safeStorageName('file_' + Date.now() + '_' + baseName);
 }
 
+async function collectReferencedStorageKeys(env) {
+  // Every storageKey referenced by any file entry, fetched with a single
+  // range query (D1) instead of one json_extract scan per key.
+  const DB = env.DB;
+  if (DB) {
+    await ensureD1KvSchema(DB);
+    const now = Math.floor(Date.now() / 1000);
+    const result = await DB.prepare(
+      `SELECT json_extract("value", '$.storageKey') AS sk FROM ${D1_KV_TABLE} WHERE "key" >= ? AND "key" < ? AND (expires_at IS NULL OR expires_at > ?)`
+    ).bind(FS_FILE_PREFIX, prefixUpperBound(FS_FILE_PREFIX), now).all();
+    const set = new Set();
+    for (const row of (result.results || [])) if (row.sk) set.add(row.sk);
+    return set;
+  }
+  const entries = await listAllFileEntries(env, '');
+  return new Set(entries.map(e => e?.storageKey).filter(Boolean));
+}
+
 async function githubFetch(url, token, accept) {
   const headers = {
     'User-Agent': 'R2-Cloud-Drive-GitHub-Sync',
@@ -7593,6 +7624,8 @@ async function handleGithubSyncBatch(request, env) {
   // Shared for the whole batch call: folders confirmed once are not
   // re-queried for every file (the free plan allows 50 D1 queries per call).
   const folderCache = new Set();
+  // Entries replaced by this batch, cleaned up afterwards with one scan.
+  const replacedSink = [];
   const results = [];
   for (const repoPath of wanted) {
     if (!allowed.has(repoPath)) {
@@ -7661,11 +7694,26 @@ async function handleGithubSyncBatch(request, env) {
       await replaceFileEntry(env, R2, fileEntryFromR2Meta(virtualPath, storageKey, object, {
         contentType: mime,
         storageType: 'r2'
-      }), folderCache);
+      }), folderCache, replacedSink);
       results.push({ path: repoPath, ok: true, size: writtenSize });
     } catch (err) {
       results.push({ path: repoPath, ok: false, error: err?.message || '同步失败' });
     }
+  }
+  // Clean up the R2 objects this batch replaced, with a single reference
+  // scan for the whole batch (the generic per-file cleanup scans once per
+  // replaced file). Best-effort: a leftover object is only wasted space,
+  // and the drive's orphan sweep can reclaim it later.
+  if (replacedSink.length) {
+    try {
+      const referenced = await collectReferencedStorageKeys(env);
+      const seen = new Set();
+      for (const old of replacedSink) {
+        if (!old?.storageKey || seen.has(old.storageKey)) continue;
+        seen.add(old.storageKey);
+        if (!referenced.has(old.storageKey)) await cleanupStorageEntry(env, R2, old);
+      }
+    } catch {}
   }
   // Resumable sync: persist progress after every batch. The files from
   // successful results are merged (path -> content hash) into the repo's sync
