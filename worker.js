@@ -584,10 +584,12 @@ function renderHTML(content, title = 'R2 云盘') {
   }
   .preview-header {
     display: flex; align-items: center; gap: 12px;
-    padding: 14px 20px;
+    padding: 6px 12px;
     border-bottom: 1px solid var(--outline);
     flex-shrink: 0;
   }
+  .preview-header .icon-btn { width: 32px; height: 32px; }
+  .preview-header .icon-btn .material-icons-round { font-size: 18px; }
   .preview-title {
     font-family: var(--font-display);
     font-size: 16px; font-weight: 500;
@@ -1059,7 +1061,7 @@ function renderHTML(content, title = 'R2 云盘') {
     .app-bar-actions { gap:0; } .app-bar-actions .icon-btn { width:34px; height:36px; } .desktop-only { display:none; }
     .toolbar { flex-wrap:nowrap; overflow-x:auto; gap:8px; } .action-bar { flex-wrap:nowrap; overflow-x:auto; } .action-btn { flex-shrink:0; }
     .action-btn span:not(.material-icons-round) { display:none; } .file-card-actions { opacity:1; }
-    .preview-overlay { padding:0; } .preview-modal { width:100%; height:100dvh; border-radius:0; } .preview-header { padding:10px; }
+    .preview-overlay { padding:0; } .preview-modal { width:100%; height:100dvh; border-radius:0; } .preview-header { padding:6px 10px; }
     .preview-header-actions { gap:0; } .selection-bar-count { font-size:12px; } .selection-bar .icon-btn { width:34px; }
     .main { padding-bottom:90px; } .upload-item-pct { width:100%; text-align:left; }
   }
