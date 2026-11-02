@@ -569,15 +569,15 @@ function renderHTML(content, title = 'R2 云盘') {
     position: fixed; inset: 0; z-index: 220;
     background: rgba(0,0,0,.7);
     display: flex; align-items: center; justify-content: center;
-    padding: 16px;
+    padding: 8px;
     opacity: 0; pointer-events: none;
     transition: opacity .2s;
   }
   .preview-overlay.open { opacity: 1; pointer-events: all; }
   .preview-modal {
     background: var(--surface); border-radius: var(--radius-l);
-    width: 100%; max-width: 92vw;
-    height: 88vh;
+    width: 100%; max-width: 97vw;
+    height: 94vh;
     box-shadow: var(--shadow-3);
     display: flex; flex-direction: column;
     overflow: hidden;
@@ -1033,7 +1033,9 @@ function renderHTML(content, title = 'R2 云盘') {
   .preview-body .preview-text-wrap { width:100%; height:100%; overflow:auto; align-self:stretch; }
   .preview-body .preview-text-wrap pre { margin:0; white-space:pre; overflow:visible; }
   .code-editor { width:100%; height:100%; display:flex; flex-direction:column; background:var(--surface); }
-  .code-toolbar { display:flex; align-items:center; gap:12px; padding:8px 12px; border-bottom:1px solid var(--outline); font-size:12px; flex-wrap:wrap; }
+  .code-toolbar { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid var(--outline); font-size:12px; flex-wrap:nowrap; }
+  .code-toolbar .btn-outlined { height:32px; padding:0 14px; font-size:13px; gap:6px; flex-shrink:0; }
+  .code-toolbar .btn-outlined .material-icons-round { font-size:16px; }
   .code-status { flex:1; color:var(--on-surface-variant); }
   .code-find { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--outline); font-size:12px; background:var(--surface); }
   .code-find[hidden] { display:none; }
@@ -1057,7 +1059,7 @@ function renderHTML(content, title = 'R2 云盘') {
     .app-bar-actions { gap:0; } .app-bar-actions .icon-btn { width:34px; height:36px; } .desktop-only { display:none; }
     .toolbar { flex-wrap:nowrap; overflow-x:auto; gap:8px; } .action-bar { flex-wrap:nowrap; overflow-x:auto; } .action-btn { flex-shrink:0; }
     .action-btn span:not(.material-icons-round) { display:none; } .file-card-actions { opacity:1; }
-    .preview-overlay { padding:6px; } .preview-modal { width:100%; height:94dvh; } .preview-header { padding:10px; }
+    .preview-overlay { padding:0; } .preview-modal { width:100%; height:100dvh; border-radius:0; } .preview-header { padding:10px; }
     .preview-header-actions { gap:0; } .selection-bar-count { font-size:12px; } .selection-bar .icon-btn { width:34px; }
     .main { padding-bottom:90px; } .upload-item-pct { width:100%; text-align:left; }
   }
@@ -1563,11 +1565,25 @@ function codeLanguage(name) {
 }
 function highlightCode(text, lang) {
   let html = escapeHtml(text);
+  // Each pass may only rewrite plain-text segments. Re-running a regex
+  // over already-inserted span markup corrupts it: the keyword pass used
+  // to wrap the word "class" inside class="tok-number" attributes, which
+  // leaked raw markup into the visible text (very visible on files that
+  // are mostly numbers, e.g. IP lists). Splitting on finished spans and
+  // skipping them keeps every pass out of the markup — and out of string
+  // and comment contents too.
+  const outsideSpans = (input, regex, replacement) => input
+    .split(/(<span class="tok-[a-z]+">[^<]*<\\/span>)/g)
+    .map((seg, i) => (i % 2 === 1 ? seg : seg.replace(regex, replacement)))
+    .join('');
   html = html.replace(/(&quot;.*?&quot;|&#39;.*?&#39;)/g, '<span class="tok-string">$1</span>');
-  html = html.replace(/\\b(0x[a-fA-F0-9]+|\\d+(?:\\.\\d+)?)\\b/g, '<span class="tok-number">$1</span>');
-  if (lang === 'config') html = html.replace(/^([\\w.-]+)(\\s*:|\\s*=)/gm, '<span class="tok-key">$1</span>$2');
-  html = html.replace(/\\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|try|catch|def|None|True|False|int|float|char|void|struct|public|private|static|new|package|interface|type)\\b/g, '<span class="tok-keyword">$1</span>');
-  html = html.replace(/(^|\\s)(#.*$|\\/\\/.*$)/gm, '$1<span class="tok-comment">$2</span>');
+  // Comments run before numbers/keywords so a keyword inside a comment
+  // is not carved out of it (and the finished comment span then shields
+  // its contents from the later passes).
+  html = outsideSpans(html, /(^|\\s)(#.*$|\\/\\/.*$)/gm, '$1<span class="tok-comment">$2</span>');
+  html = outsideSpans(html, /\\b(0x[a-fA-F0-9]+|\\d+(?:\\.\\d+)?)\\b/g, '<span class="tok-number">$1</span>');
+  if (lang === 'config') html = outsideSpans(html, /^([\\w.-]+)(\\s*:|\\s*=)/gm, '<span class="tok-key">$1</span>$2');
+  html = outsideSpans(html, /\\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|try|catch|def|None|True|False|int|float|char|void|struct|public|private|static|new|package|interface|type)\\b/g, '<span class="tok-keyword">$1</span>');
   return html;
 }
 function renderCodeEditor(text, name, readonly) {
@@ -1575,9 +1591,9 @@ function renderCodeEditor(text, name, readonly) {
   if (!body) return;
   const lang = codeLanguage(name);
   body.innerHTML = '<div class="code-editor">'
-    + '<div class="code-toolbar"><span>纯文本 / ' + escapeHtml(lang) + '</span><span class="code-status" id="codeStatus">' + (readonly ? '分享预览只读' : '可编辑，Ctrl+S 保存') + '</span>'
-    + '<button class="btn-outlined" id="codeFindBtn"><span class="material-icons-round">search</span> 查找</button>'
+    + '<div class="code-toolbar">'
     + '<button class="btn-outlined" id="codeWrapBtn" title="长行自动折行显示，不用左右滑动"><span class="material-icons-round">wrap_text</span> 换行</button>'
+    + '<button class="btn-outlined" id="codeFindBtn"><span class="material-icons-round">search</span> 查找</button>'
     + (readonly ? '' : '<button class="btn-outlined" onclick="saveCodeEditor()"><span class="material-icons-round">save</span> 保存</button>')
     + '</div>'
     + '<div class="code-find" id="codeFindBar" hidden><span class="material-icons-round">search</span>'
@@ -1739,7 +1755,7 @@ async function saveCodeEditor() {
   const textarea = document.getElementById('codeTextarea');
   const status = document.getElementById('codeStatus');
   if (!textarea || !previewPath || window.__shareId) return;
-  status.textContent = '保存中...';
+  if (status) status.textContent = '保存中...';
   try {
     const res = await fetch('/api/text-file?path=' + encodeURIComponent(previewPath), {
       method: 'PUT',
@@ -1749,11 +1765,12 @@ async function saveCodeEditor() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || '保存失败');
     previewOriginalEtag = data.etag || '';
-    status.textContent = '已保存 ' + new Date().toLocaleTimeString();
+    if (status) status.textContent = '已保存 ' + new Date().toLocaleTimeString();
     showSnackbar('文件已保存');
   } catch (err) {
-    status.textContent = '保存失败：' + (err.message || '未知错误');
-    showSnackbar(status.textContent);
+    const msg = '保存失败：' + (err.message || '未知错误');
+    if (status) status.textContent = msg;
+    showSnackbar(msg);
   }
 }
 
