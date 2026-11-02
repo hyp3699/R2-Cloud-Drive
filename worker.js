@@ -7673,10 +7673,14 @@ async function handleGithubSyncFinalize(request, env, ctx) {
     const prevPaths = previous.files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean);
     removed = prevPaths.filter(p => !current.has(p)).map(p => session.targetDir + '/' + p);
   }
+  // A path that is back in the current file list (deleted upstream, queued
+  // for cleanup, then restored upstream) must leave the queue at once —
+  // otherwise the cleanup below would delete the freshly synced file.
+  const currentPaths = new Set((session.files || []).map(f => session.targetDir + '/' + f.path));
   const pendingDeletes = [...new Set([
     ...(Array.isArray(previous?.pendingDeletes) ? previous.pendingDeletes : []),
     ...removed
-  ].filter(p => typeof p === 'string' && p.startsWith(session.targetDir + '/')))];
+  ].filter(p => typeof p === 'string' && p.startsWith(session.targetDir + '/') && !currentPaths.has(p)))];
   let deleted = 0;
   // Reconcile with the progress that batch calls merged into the record:
   // a file only counts as synced if its content hash actually landed there.
@@ -7711,13 +7715,20 @@ async function handleGithubSyncFinalize(request, env, ctx) {
   // what the cleanup below does.
   await kvPutJson(env, recordKey, record);
   await kvDelete(env, GITHUB_SYNC_SESSION_PREFIX + sessionId);
-  // Best-effort cleanup of upstream-deleted files, a few per call.
+  // Best-effort cleanup of upstream-deleted files, a few per call. The
+  // deletions defer their R2 object cleanup through ctx.waitUntil, whose
+  // queries share this invocation's budget and may never run if it is
+  // spent — orphaning the objects silently. Capture those promises with a
+  // shim ctx and await them here instead, where the remaining budget is
+  // known and sufficient.
+  const cleanupTasks = [];
+  const cleanupCtx = { waitUntil: (p) => { cleanupTasks.push(Promise.resolve(p).catch(() => {})); } };
   const stillPending = [];
   const attempt = pendingDeletes.slice(0, GITHUB_SYNC_FINALIZE_DELETE_MAX);
   const deferred = pendingDeletes.slice(GITHUB_SYNC_FINALIZE_DELETE_MAX);
   for (const p of attempt) {
     try {
-      const result = await deleteMultipleVirtualPaths(env, R2, [p], ctx);
+      const result = await deleteMultipleVirtualPaths(env, R2, [p], cleanupCtx);
       deleted += result?.deleted ?? 0;
     } catch {
       stillPending.push(p);
@@ -7728,6 +7739,7 @@ async function handleGithubSyncFinalize(request, env, ctx) {
     record.pendingDeletes = remaining;
     try { await kvPutJson(env, recordKey, record); } catch {}
   }
+  await Promise.all(cleanupTasks);
   return jsonResponse({
     ok: true, complete: allOk, sha: record.sha, targetDir: session.targetDir,
     fileCount: record.fileCount, deleted,
