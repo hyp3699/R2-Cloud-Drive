@@ -3316,7 +3316,7 @@ async function runGithubSyncForSource(source, onFileProgress) {
       body: JSON.stringify({ sessionId: prep.sessionId, files: batch.map(f => f.path) })
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || '同步中断，请重试（已同步的文件不会丢失）');
+    if (!res.ok || !data.ok) throw new Error(data.error || '同步中断，再次同步会接着上次的进度继续（已完成的文件会自动跳过）');
     for (const r of (data.results || [])) {
       done++;
       if (!r.ok) failures.push(r);
@@ -7506,6 +7506,35 @@ async function handleGithubSyncBatch(request, env) {
       results.push({ path: repoPath, ok: true, size: bytes.byteLength });
     } catch (err) {
       results.push({ path: repoPath, ok: false, error: err?.message || '同步失败' });
+    }
+  }
+  // Resumable sync: persist progress after every batch. The files from
+  // successful results are merged (path -> content hash) into the repo's sync
+  // record, while the record's commit sha is left untouched until finalize.
+  // If the sync is interrupted (network error, tab closed, session expiry),
+  // the next prepare compares against these merged hashes and skips the
+  // files that already made it — the sync resumes instead of restarting.
+  const succeeded = results.filter(r => r.ok).map(r => r.path);
+  if (succeeded.length) {
+    try {
+      const blobByPath = new Map((session.files || []).map(f => [f.path, f.blob || '']));
+      const recordKey = githubSyncRecordKey(session.owner, session.repo);
+      const record = (await kvGetJson(env, recordKey)) || {
+        owner: session.owner, repo: session.repo, branch: session.branch, sha: '',
+        targetDir: session.targetDir, files: [], fileCount: 0, syncedAt: ''
+      };
+      const merged = new Map();
+      for (const f of (record.files || [])) {
+        if (typeof f === 'string') merged.set(f, '');
+        else if (f && f.path) merged.set(f.path, f.blob || '');
+      }
+      for (const p of succeeded) merged.set(p, blobByPath.get(p) || '');
+      record.files = [...merged.entries()].map(([path, blob]) => ({ path, blob }));
+      record.targetDir = session.targetDir;
+      await kvPutJson(env, recordKey, record);
+    } catch {
+      // Progress persistence is best-effort: losing it only means the next
+      // sync redoes this batch, never that files are wrong.
     }
   }
   return jsonResponse({ ok: true, results });
