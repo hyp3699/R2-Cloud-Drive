@@ -3301,7 +3301,10 @@ async function runGithubSyncForSource(source, onFileProgress) {
   let cur = [], curBytes = 0;
   for (const f of files) {
     const size = f.size || 0;
-    if (cur.length && (cur.length >= 10 || curBytes + size > 16 * 1024 * 1024)) {
+    // 2 files per request: each file costs ~11 D1 queries in the metadata
+    // layer (plus one-off folder creation) and the Workers free plan
+    // allows 50 per invocation — keep real headroom, not just the average.
+    if (cur.length && (cur.length >= 2 || curBytes + size > 16 * 1024 * 1024)) {
       batches.push(cur); cur = []; curBytes = 0;
     }
     cur.push(f); curBytes += size;
@@ -3340,6 +3343,7 @@ async function runGithubSyncForSource(source, onFileProgress) {
   let text = '同步完成 · ' + fin.fileCount + ' 个文件 · commit ' + String(fin.sha || '').slice(0, 7);
   if (prep.skippedFiles) text += ' · 跳过 ' + prep.skippedFiles + ' 个未变化文件';
   if (fin.deleted) text += ' · 清理 ' + fin.deleted + ' 个已删除文件';
+  if (fin.pendingDeletes) text += ' · 另有 ' + fin.pendingDeletes + ' 个旧文件将在下次同步清理';
   if (failures.length) text += ' · ' + failures.length + ' 个失败，可再次同步重试';
   ghSetSourceStatus(source.id, text);
   return { state: 'synced', message: label + ' ' + text };
@@ -5696,16 +5700,25 @@ async function getFolderEntry(env, path) {
   return entry?.type === 'folder' ? { ...entry, path: clean, name: entry.name || virtualPathName(clean) } : null;
 }
 
-async function ensureFolderHierarchy(env, folderPath = '') {
+async function ensureFolderHierarchy(env, folderPath = '', knownFolders = null) {
   const clean = assertVirtualPath(folderPath, { allowRoot: true });
   if (!clean) return;
   const parts = clean.split('/').filter(Boolean);
   let current = '';
   for (const part of parts) {
     current = current ? current + '/' + part : part;
-    if (await getFileEntry(env, current)) throw new Error('parent path is a file');
+    // Optional per-invocation memo: folders already confirmed in this call
+    // skip their existence queries entirely. Callers that write many files
+    // into the same folders (GitHub sync batches) pass one shared Set; the
+    // memo never outlives the invocation, so it cannot go stale across
+    // requests. Steady state costs ONE query per level: the folder entry is
+    // checked first, and the "is it a file?" conflict check only runs when
+    // the folder does not exist (the creation path).
+    if (knownFolders && knownFolders.has(current)) continue;
     const existing = await getFolderEntry(env, current);
+    if (knownFolders) knownFolders.add(current);
     if (!existing) {
+      if (await getFileEntry(env, current)) throw new Error('parent path is a file');
       const now = new Date().toISOString();
       await kvPutJson(env, folderEntryKey(current), {
         type: 'folder',
@@ -5761,10 +5774,10 @@ function fileEntryFromR2Meta(path, storageKey, meta, overrides = {}) {
   };
 }
 
-async function putFileEntry(env, entry) {
+async function putFileEntry(env, entry, knownFolders = null) {
   const clean = assertVirtualPath(entry.path);
   if (await getFolderEntry(env, clean)) throw new Error('path exists as folder');
-  await ensureFolderHierarchy(env, virtualParentPath(clean));
+  await ensureFolderHierarchy(env, virtualParentPath(clean), knownFolders);
   const stored = {
     ...entry,
     type: 'file',
@@ -5873,10 +5886,10 @@ async function cleanupStorageEntry(env, R2, entry) {
   await R2.delete(entry.storageKey);
 }
 
-async function replaceFileEntry(env, R2, entry) {
+async function replaceFileEntry(env, R2, entry, knownFolders = null) {
   const clean = assertVirtualPath(entry.path);
   const existing = await getFileEntry(env, clean);
-  await putFileEntry(env, entry);
+  await putFileEntry(env, entry, knownFolders);
   if (existing && existing.storageKey !== entry.storageKey) {
     await cleanupUnreferencedStorage(env, R2, existing);
   }
@@ -7158,6 +7171,9 @@ const GITHUB_SYNC_MAX_FILE_BYTES = 95 * 1024 * 1024;
 // Files at least this large are streamed to R2 instead of buffered whole in
 // the Worker's 128 MB memory (see handleGithubSyncBatch).
 const GITHUB_SYNC_STREAM_MIN_BYTES = 4 * 1024 * 1024;
+// Upstream-deleted files cleaned up per finalize call; the rest stay in the
+// record's pendingDeletes and are retried by later syncs (free-plan budget).
+const GITHUB_SYNC_FINALIZE_DELETE_MAX = 6;
 
 function githubSyncRecordKey(owner, repo) {
   return GITHUB_SYNC_RECORD_PREFIX + String(owner).toLowerCase() + '/' + String(repo).toLowerCase();
@@ -7420,20 +7436,34 @@ async function handleGithubSyncPrepare(request, env) {
 
     // Which recorded files are actually still in the drive? A file the user
     // deleted by hand counts as not synced even when the commit matches —
-    // otherwise "up to date" would strand it forever.
+    // otherwise "up to date" would strand it forever. One prefix list query
+    // (1000 keys per page) answers this; walking directory indexes and
+    // reading every file entry would blow the free plan's 50-queries-per-
+    // invocation D1 budget on any real repo.
     let actualPaths = null;
     if (record && Array.isArray(record.files) && record.files.length) {
       try {
-        const entries = await listAllFileEntries(env, targetDir);
-        actualPaths = new Set(entries.map(e => e.path.slice(targetDir.length + 1)));
+        const prefix = fileEntryKey(targetDir) + '/';
+        const keys = await kvListKeys(env, prefix);
+        actualPaths = new Set(keys.map(k => k.slice(prefix.length)));
       } catch { actualPaths = null; }
     }
     const recordPaths = record && Array.isArray(record.files)
       ? record.files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean)
       : [];
     const missingCount = actualPaths ? recordPaths.filter(p => !actualPaths.has(p)).length : 0;
+    // A record left by an incomplete sync (some files never landed, or
+    // upstream deletions are still pending cleanup) must never read as
+    // "up to date" just because the commit matches again — e.g. upstream
+    // force-pushed back to the old commit after a partial sync.
+    const hasPendingBlobs = !!record && Array.isArray(record.files) &&
+      record.files.some(f => typeof f === 'string' || !f.blob);
+    const pendingDeletes = record && Array.isArray(record.pendingDeletes)
+      ? record.pendingDeletes.filter(p => typeof p === 'string' && p)
+      : [];
 
-    if (record && record.sha === sha && !body.force && missingCount === 0) {
+    if (record && record.sha === sha && !body.force && missingCount === 0 &&
+        !hasPendingBlobs && !pendingDeletes.length) {
       return jsonResponse({
         ok: true, upToDate: true, owner, repo, branch, sha, targetDir,
         fileCount: record.fileCount || (Array.isArray(record.files) ? record.files.length : 0),
@@ -7477,6 +7507,10 @@ async function handleGithubSyncPrepare(request, env) {
       (actualPaths && !actualPaths.has(f.path)) // deleted in the drive → restore it
     );
     const skippedFiles = files.length - changedFiles.length;
+    // Pre-create the base folder chain (GitHub同步/<owner>/<repo>) inside
+    // prepare's roomy query budget, so the first batch call does not have
+    // to pay folder-creation costs on top of its file writes.
+    await ensureFolderHierarchy(env, targetDir);
     const sessionId = crypto.randomUUID();
     const totalBytes = changedFiles.reduce((sum, f) => sum + (f.size || 0), 0);
     // The token rides along in the short-lived session (1 h TTL) so batch
@@ -7508,6 +7542,9 @@ async function handleGithubSyncBatch(request, env) {
     : [];
   if (!wanted.length) return jsonResponse({ ok: false, error: '没有要同步的文件' }, 400);
   const allowed = new Map((session.files || []).map(f => [f.path, f.size || 0]));
+  // Shared for the whole batch call: folders confirmed once are not
+  // re-queried for every file (the free plan allows 50 D1 queries per call).
+  const folderCache = new Set();
   const results = [];
   for (const repoPath of wanted) {
     if (!allowed.has(repoPath)) {
@@ -7567,7 +7604,7 @@ async function handleGithubSyncBatch(request, env) {
       await replaceFileEntry(env, R2, fileEntryFromR2Meta(virtualPath, storageKey, object, {
         contentType: mime,
         storageType: 'r2'
-      }));
+      }), folderCache);
       results.push({ path: repoPath, ok: true, size: writtenSize });
     } catch (err) {
       results.push({ path: repoPath, ok: false, error: err?.message || '同步失败' });
@@ -7584,7 +7621,11 @@ async function handleGithubSyncBatch(request, env) {
     try {
       const blobByPath = new Map((session.files || []).map(f => [f.path, f.blob || '']));
       const recordKey = githubSyncRecordKey(session.owner, session.repo);
-      const record = (await kvGetJson(env, recordKey)) || {
+      let record = await kvGetJson(env, recordKey);
+      // A record written for a differently-cased folder belongs to that
+      // folder: never merge this session's progress into it.
+      if (record && record.targetDir && record.targetDir !== session.targetDir) record = null;
+      record = record || {
         owner: session.owner, repo: session.repo, branch: session.branch, sha: '',
         targetDir: session.targetDir, files: [], fileCount: 0, syncedAt: ''
       };
@@ -7602,6 +7643,11 @@ async function handleGithubSyncBatch(request, env) {
       // sync redoes this batch, never that files are wrong.
     }
   }
+  // Long syncs (thousands of files in small free-plan batches) can outlive
+  // the session's 1 h TTL; every batch renews it.
+  try {
+    await kvPutJson(env, GITHUB_SYNC_SESSION_PREFIX + sessionId, session, { expirationTtl: 3600 });
+  } catch {}
   return jsonResponse({ ok: true, results });
 }
 
@@ -7613,17 +7659,25 @@ async function handleGithubSyncFinalize(request, env, ctx) {
   if (!session) return jsonResponse({ ok: false, error: '同步会话已过期，请重新开始同步' }, 400);
   const recordKey = githubSyncRecordKey(session.owner, session.repo);
   const previous = await kvGetJson(env, recordKey);
-  let deleted = 0;
-  if (previous && Array.isArray(previous.files) && previous.targetDir === session.targetDir) {
+  // Files that disappeared upstream become pending deletions. They are
+  // carried inside the record and cleaned up AFTER the record is saved,
+  // capped per call — a deletion failure (e.g. the free plan's D1 query
+  // budget) must never wedge the sync itself, and whatever is left over is
+  // retried by the next sync's finalize. (Records written before targetDir
+  // was tracked count as matching.)
+  let removed = [];
+  if (previous && Array.isArray(previous.files) &&
+      (!previous.targetDir || previous.targetDir === session.targetDir)) {
     const current = new Set((session.files || []).map(f => f.path));
     // Previous records may hold plain path strings (legacy) or {path, blob}.
     const prevPaths = previous.files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean);
-    const removed = prevPaths.filter(p => !current.has(p)).map(p => session.targetDir + '/' + p);
-    if (removed.length) {
-      const result = await deleteMultipleVirtualPaths(env, R2, removed, ctx);
-      deleted = result?.deleted ?? removed.length;
-    }
+    removed = prevPaths.filter(p => !current.has(p)).map(p => session.targetDir + '/' + p);
   }
+  const pendingDeletes = [...new Set([
+    ...(Array.isArray(previous?.pendingDeletes) ? previous.pendingDeletes : []),
+    ...removed
+  ].filter(p => typeof p === 'string' && p.startsWith(session.targetDir + '/')))];
+  let deleted = 0;
   // Reconcile with the progress that batch calls merged into the record:
   // a file only counts as synced if its content hash actually landed there.
   // Files that failed (or were never attempted) keep an EMPTY hash and the
@@ -7650,14 +7704,35 @@ async function handleGithubSyncFinalize(request, env, ctx) {
     targetDir: session.targetDir,
     files: recordFiles,
     fileCount: allOk ? recordFiles.length : (previous?.fileCount || 0),
-    syncedAt: allOk ? new Date().toISOString() : (previous?.syncedAt || '')
+    syncedAt: allOk ? new Date().toISOString() : (previous?.syncedAt || ''),
+    pendingDeletes
   };
+  // Save the record FIRST: from here on the sync state is durable no matter
+  // what the cleanup below does.
   await kvPutJson(env, recordKey, record);
   await kvDelete(env, GITHUB_SYNC_SESSION_PREFIX + sessionId);
+  // Best-effort cleanup of upstream-deleted files, a few per call.
+  const stillPending = [];
+  const attempt = pendingDeletes.slice(0, GITHUB_SYNC_FINALIZE_DELETE_MAX);
+  const deferred = pendingDeletes.slice(GITHUB_SYNC_FINALIZE_DELETE_MAX);
+  for (const p of attempt) {
+    try {
+      const result = await deleteMultipleVirtualPaths(env, R2, [p], ctx);
+      deleted += result?.deleted ?? 0;
+    } catch {
+      stillPending.push(p);
+    }
+  }
+  const remaining = [...stillPending, ...deferred];
+  if (remaining.length !== pendingDeletes.length) {
+    record.pendingDeletes = remaining;
+    try { await kvPutJson(env, recordKey, record); } catch {}
+  }
   return jsonResponse({
     ok: true, complete: allOk, sha: record.sha, targetDir: session.targetDir,
     fileCount: record.fileCount, deleted,
-    pendingFiles: recordFiles.filter(f => !f.blob).length
+    pendingFiles: recordFiles.filter(f => !f.blob).length,
+    pendingDeletes: remaining.length
   });
 }
 
