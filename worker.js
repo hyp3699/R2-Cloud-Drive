@@ -1043,10 +1043,12 @@ function renderHTML(content, title = 'R2 云盘') {
   .code-find-btn:hover { background:rgba(127,127,127,.12); }
   .code-find-btn.active { background:rgba(66,133,244,.18); color:var(--on-surface); border-color:rgba(66,133,244,.4); }
   .code-find .material-icons-round { font-size:18px; }
+  .code-toolbar .btn-outlined.active { background:rgba(66,133,244,.18); border-color:rgba(66,133,244,.4); }
   .code-surface { position:relative; flex:1; min-height:0; overflow:hidden; }
   .code-surface pre, .code-surface textarea { position:absolute; inset:0; width:100%; height:100%; border:0; margin:0; padding:16px; font:14px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:normal; tab-size:4; white-space:pre; overflow:auto; text-align:left; border-radius:0; }
   .code-surface pre { pointer-events:none; color:var(--on-surface); background:transparent; }
-  .code-surface textarea { resize:none; background:transparent; color:transparent; caret-color:var(--on-surface); -webkit-text-fill-color:transparent; outline:none; }
+  .code-surface textarea { resize:none; background:transparent; color:transparent; caret-color:var(--on-surface); -webkit-text-fill-color:transparent; outline:none; touch-action:pan-x pan-y; -webkit-overflow-scrolling:touch; }
+  .code-surface.wrap pre, .code-surface.wrap textarea { white-space:pre-wrap; overflow-wrap:break-word; }
   .code-surface textarea::selection { background:rgba(66,133,244,.30); }
   .tok-comment { color:#5c8062; } .tok-string { color:#a53e20; } .tok-keyword { color:#8654b5; font-weight:600; } .tok-number { color:#146a9a; } .tok-key { color:#1565c0; }
   [data-theme="dark"] .tok-comment { color:#8aab80; } [data-theme="dark"] .tok-string { color:#e7ad85; } [data-theme="dark"] .tok-keyword { color:#c5a3f0; } [data-theme="dark"] .tok-number { color:#8dcce8; } [data-theme="dark"] .tok-key { color:#8ab4f8; }
@@ -1575,6 +1577,7 @@ function renderCodeEditor(text, name, readonly) {
   body.innerHTML = '<div class="code-editor">'
     + '<div class="code-toolbar"><span>纯文本 / ' + escapeHtml(lang) + '</span><span class="code-status" id="codeStatus">' + (readonly ? '分享预览只读' : '可编辑，Ctrl+S 保存') + '</span>'
     + '<button class="btn-outlined" id="codeFindBtn"><span class="material-icons-round">search</span> 查找</button>'
+    + '<button class="btn-outlined" id="codeWrapBtn" title="长行自动折行显示，不用左右滑动"><span class="material-icons-round">wrap_text</span> 换行</button>'
     + (readonly ? '' : '<button class="btn-outlined" onclick="saveCodeEditor()"><span class="material-icons-round">save</span> 保存</button>')
     + '</div>'
     + '<div class="code-find" id="codeFindBar" hidden><span class="material-icons-round">search</span>'
@@ -1624,6 +1627,26 @@ function renderCodeEditor(text, name, readonly) {
   textarea.addEventListener('input', queueHighlight);
   textarea.addEventListener('scroll', syncScroll, { passive: true });
   textarea.addEventListener('keydown', e => { if (!readonly && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveCodeEditor(); } });
+  // ── Word wrap toggle ──
+  // Long lines otherwise need horizontal panning, which is awkward on
+  // touch screens (a drag in an editable textarea often selects text
+  // instead of scrolling). With wrap on, both layers wrap identically so
+  // the overlay alignment holds and no horizontal scrolling is needed.
+  const surface = body.querySelector('.code-surface');
+  const wrapBtn = document.getElementById('codeWrapBtn');
+  let wrapOn = false;
+  try { wrapOn = localStorage.getItem('codeEditorWrap') === '1'; } catch {}
+  const applyWrap = () => {
+    surface.classList.toggle('wrap', wrapOn);
+    wrapBtn.classList.toggle('active', wrapOn);
+    syncScroll();
+  };
+  wrapBtn.addEventListener('click', () => {
+    wrapOn = !wrapOn;
+    try { localStorage.setItem('codeEditorWrap', wrapOn ? '1' : '0'); } catch {}
+    applyWrap();
+  });
+  applyWrap();
   // ── In-editor find (Ctrl+F) ──
   // Matches are computed on the raw text and navigated via the textarea's
   // selection (visible through the transparent text layer); the highlight
@@ -1661,8 +1684,12 @@ function renderCodeEditor(text, name, readonly) {
     const start = findMatches[findIndex];
     if (focusEditor) textarea.focus();
     textarea.setSelectionRange(start, start + findInput.value.length);
-    const line = textarea.value.slice(0, start).split('\\n').length - 1;
-    textarea.scrollTop = Math.max(0, line * 22.4 - textarea.clientHeight / 2);
+    if (!wrapOn) {
+      // With wrap on, visual lines no longer map to text lines; the
+      // browser's own reveal-on-selection handles positioning instead.
+      const line = textarea.value.slice(0, start).split('\\n').length - 1;
+      textarea.scrollTop = Math.max(0, line * 22.4 - textarea.clientHeight / 2);
+    }
     syncScroll();
     renderFindCount();
   };
