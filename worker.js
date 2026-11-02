@@ -7701,9 +7701,15 @@ async function handleGithubSyncBatch(request, env) {
     }
   }
   // Long syncs (thousands of files in small free-plan batches) can outlive
-  // the session's 1 h TTL; every batch renews it.
+  // the session's 1 h TTL, so batches renew it — but at most every 30
+  // minutes: re-writing the (possibly several-hundred-KB) session JSON on
+  // every 2-file batch is pure overhead on large repos.
   try {
-    await kvPutJson(env, GITHUB_SYNC_SESSION_PREFIX + sessionId, session, { expirationTtl: 3600 });
+    const refreshedAt = Number(session.refreshedAt || 0);
+    if (Date.now() - refreshedAt > 30 * 60 * 1000) {
+      session.refreshedAt = Date.now();
+      await kvPutJson(env, GITHUB_SYNC_SESSION_PREFIX + sessionId, session, { expirationTtl: 3600 });
+    }
   } catch {}
   return jsonResponse({ ok: true, results });
 }
