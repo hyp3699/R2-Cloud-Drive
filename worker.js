@@ -1432,6 +1432,9 @@ let previewName = '';
 let previewOriginalEtag = '';
 
 function getPreviewType(name) {
+  // Extensionless files may well be text (LICENSE, notes, you…): try the
+  // text editor; the server sniffs the content and rejects real binaries.
+  if (!name.includes('.')) return 'text';
   const ext = name.split('.').pop()?.toLowerCase() || '';
   const imageExts = ['jpg','jpeg','png','gif','webp','svg','bmp','ico'];
   const videoExts = ['mp4','webm','ogg','avi','mov','mkv'];
@@ -6856,8 +6859,20 @@ async function storedVirtualFileResponse(request, R2, path, env, options = {}) {
 
 function isEditableTextFile(path = '') {
   const name = virtualPathName(path).toLowerCase();
-  const ext = name.includes('.') ? name.split('.').pop() : name;
+  // Extensionless files (LICENSE, you, notes…) are text CANDIDATES: GitHub
+  // decides by content, and so do we — textFileResponse sniffs the actual
+  // bytes for these and still rejects binaries. Known extensions must be
+  // on the whitelist.
+  if (!name.includes('.')) return true;
+  const ext = name.split('.').pop();
   return ['txt','md','markdown','log','csv','json','jsonl','xml','html','css','js','ts','jsx','tsx','mjs','cjs','py','java','c','cpp','h','hpp','go','rs','rb','php','sh','bash','zsh','ps1','sql','yaml','yml','toml','ini','cfg','conf','env','gitignore','dockerfile','makefile'].includes(ext);
+}
+
+function looksLikeTextBytes(bytes) {
+  // The classic git heuristic: a NUL byte in the first chunk means binary.
+  const n = Math.min(bytes.length, 8192);
+  for (let i = 0; i < n; i++) if (bytes[i] === 0) return false;
+  return true;
 }
 
 async function textFileResponse(request, env, R2, path) {
@@ -6867,9 +6882,20 @@ async function textFileResponse(request, env, R2, path) {
   if (!entry) return jsonResponse({ ok: false, error: 'file not found' }, 404);
   const meta = await R2.head(entry.storageKey);
   if (!meta) return jsonResponse({ ok: false, error: 'storage object not found' }, 404);
+  // Extensionless files passed the name check as candidates only: verify
+  // the content is really text before letting anyone view-edit or
+  // overwrite it (a renamed binary must not be garbled or clobbered).
+  const extensionless = !virtualPathName(clean).includes('.');
   if (request.method === 'GET') {
     const obj = await R2.get(entry.storageKey);
     if (!obj) return jsonResponse({ ok: false, error: 'storage object not found' }, 404);
+    if (extensionless) {
+      const buf = new Uint8Array(await obj.arrayBuffer());
+      if (!looksLikeTextBytes(buf)) return jsonResponse({ ok: false, error: 'not an editable text file' }, 400);
+      return new Response(buf, {
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Cache-Control': 'no-store', 'ETag': meta.etag || '' }
+      });
+    }
     return new Response(obj.body, {
       headers: {
         'Content-Type': (entry.contentType && entry.contentType.startsWith('text/')) ? entry.contentType : 'text/plain;charset=UTF-8',
@@ -6877,6 +6903,13 @@ async function textFileResponse(request, env, R2, path) {
         'ETag': meta.etag || ''
       }
     });
+  }
+  if (extensionless) {
+    const obj = await R2.get(entry.storageKey);
+    if (!obj) return jsonResponse({ ok: false, error: 'storage object not found' }, 404);
+    if (!looksLikeTextBytes(new Uint8Array(await obj.arrayBuffer()))) {
+      return jsonResponse({ ok: false, error: 'not an editable text file' }, 400);
+    }
   }
   const expected = request.headers.get('If-Match') || '';
   if (expected && meta.etag && expected !== meta.etag) {
