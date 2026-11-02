@@ -1035,6 +1035,14 @@ function renderHTML(content, title = 'R2 云盘') {
   .code-editor { width:100%; height:100%; display:flex; flex-direction:column; background:var(--surface); }
   .code-toolbar { display:flex; align-items:center; gap:12px; padding:8px 12px; border-bottom:1px solid var(--outline); font-size:12px; flex-wrap:wrap; }
   .code-status { flex:1; color:var(--on-surface-variant); }
+  .code-find { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--outline); font-size:12px; background:var(--surface); }
+  .code-find[hidden] { display:none; }
+  .code-find input { flex:1; min-width:0; padding:6px 8px; border:1px solid var(--outline); border-radius:6px; background:transparent; color:var(--on-surface); font-size:13px; outline:none; }
+  .code-find-count { color:var(--on-surface-variant); white-space:nowrap; min-width:44px; text-align:center; }
+  .code-find-btn { display:inline-flex; align-items:center; justify-content:center; min-width:28px; height:28px; padding:0 4px; border:1px solid transparent; border-radius:6px; background:transparent; color:var(--on-surface-variant); cursor:pointer; font-size:12px; }
+  .code-find-btn:hover { background:rgba(127,127,127,.12); }
+  .code-find-btn.active { background:rgba(66,133,244,.18); color:var(--on-surface); border-color:rgba(66,133,244,.4); }
+  .code-find .material-icons-round { font-size:18px; }
   .code-surface { position:relative; flex:1; min-height:0; overflow:hidden; }
   .code-surface pre, .code-surface textarea { position:absolute; inset:0; width:100%; height:100%; border:0; margin:0; padding:16px; font:14px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:normal; tab-size:4; white-space:pre; overflow:auto; text-align:left; border-radius:0; }
   .code-surface pre { pointer-events:none; color:var(--on-surface); background:transparent; }
@@ -1566,8 +1574,17 @@ function renderCodeEditor(text, name, readonly) {
   const lang = codeLanguage(name);
   body.innerHTML = '<div class="code-editor">'
     + '<div class="code-toolbar"><span>纯文本 / ' + escapeHtml(lang) + '</span><span class="code-status" id="codeStatus">' + (readonly ? '分享预览只读' : '可编辑，Ctrl+S 保存') + '</span>'
+    + '<button class="btn-outlined" id="codeFindBtn"><span class="material-icons-round">search</span> 查找</button>'
     + (readonly ? '' : '<button class="btn-outlined" onclick="saveCodeEditor()"><span class="material-icons-round">save</span> 保存</button>')
-    + '</div><div class="code-surface"><pre id="codeHighlight"></pre><textarea id="codeTextarea" spellcheck="false" ' + (readonly ? 'readonly' : '') + '></textarea></div></div>';
+    + '</div>'
+    + '<div class="code-find" id="codeFindBar" hidden><span class="material-icons-round">search</span>'
+    + '<input id="codeFindInput" type="text" placeholder="在文件中查找" autocomplete="off">'
+    + '<span class="code-find-count" id="codeFindCount"></span>'
+    + '<button type="button" class="code-find-btn" id="codeFindCase" title="区分大小写">Aa</button>'
+    + '<button type="button" class="code-find-btn" id="codeFindPrev" title="上一个 (Shift+Enter)"><span class="material-icons-round">keyboard_arrow_up</span></button>'
+    + '<button type="button" class="code-find-btn" id="codeFindNext" title="下一个 (Enter)"><span class="material-icons-round">keyboard_arrow_down</span></button>'
+    + '<button type="button" class="code-find-btn" id="codeFindClose" title="关闭 (Esc)"><span class="material-icons-round">close</span></button></div>'
+    + '<div class="code-surface"><pre id="codeHighlight"></pre><textarea id="codeTextarea" spellcheck="false" ' + (readonly ? 'readonly' : '') + '></textarea></div></div>';
   const textarea = document.getElementById('codeTextarea');
   const pre = document.getElementById('codeHighlight');
   // Performance: the original code re-ran the full-file highlight and rebuilt
@@ -1607,6 +1624,88 @@ function renderCodeEditor(text, name, readonly) {
   textarea.addEventListener('input', queueHighlight);
   textarea.addEventListener('scroll', syncScroll, { passive: true });
   textarea.addEventListener('keydown', e => { if (!readonly && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveCodeEditor(); } });
+  // ── In-editor find (Ctrl+F) ──
+  // Matches are computed on the raw text and navigated via the textarea's
+  // selection (visible through the transparent text layer); the highlight
+  // <pre> is only scrolled in sync, never re-rendered for search.
+  const findBar = document.getElementById('codeFindBar');
+  const findInput = document.getElementById('codeFindInput');
+  const findCount = document.getElementById('codeFindCount');
+  const findCaseBtn = document.getElementById('codeFindCase');
+  let findMatches = [];
+  let findIndex = -1;
+  let findCaseSensitive = false;
+  const renderFindCount = () => {
+    if (!findInput.value) findCount.textContent = '';
+    else if (!findMatches.length) findCount.textContent = '无结果';
+    else findCount.textContent = (findIndex + 1) + ' / ' + findMatches.length;
+  };
+  const computeFindMatches = () => {
+    findMatches = [];
+    const q = findInput.value;
+    if (q) {
+      const hay = findCaseSensitive ? textarea.value : textarea.value.toLowerCase();
+      const needle = findCaseSensitive ? q : q.toLowerCase();
+      let i = hay.indexOf(needle);
+      while (i !== -1) {
+        findMatches.push(i);
+        i = hay.indexOf(needle, i + Math.max(1, needle.length));
+      }
+    }
+    if (findIndex >= findMatches.length) findIndex = findMatches.length - 1;
+    renderFindCount();
+  };
+  const gotoFindMatch = (idx, focusEditor) => {
+    if (!findMatches.length) { renderFindCount(); return; }
+    findIndex = ((idx % findMatches.length) + findMatches.length) % findMatches.length;
+    const start = findMatches[findIndex];
+    if (focusEditor) textarea.focus();
+    textarea.setSelectionRange(start, start + findInput.value.length);
+    const line = textarea.value.slice(0, start).split('\\n').length - 1;
+    textarea.scrollTop = Math.max(0, line * 22.4 - textarea.clientHeight / 2);
+    syncScroll();
+    renderFindCount();
+  };
+  const jumpToNearestMatch = (focusEditor) => {
+    if (!findMatches.length) { renderFindCount(); return; }
+    const pos = textarea.selectionStart || 0;
+    let idx = findMatches.findIndex(s => s >= pos);
+    if (idx === -1) idx = 0;
+    gotoFindMatch(idx, focusEditor);
+  };
+  const openFind = () => {
+    findBar.hidden = false;
+    const sel = textarea.value.slice(textarea.selectionStart, textarea.selectionEnd);
+    if (sel && sel.indexOf('\\n') === -1 && sel.length < 80) findInput.value = sel;
+    computeFindMatches();
+    findInput.focus();
+    findInput.select();
+    jumpToNearestMatch(false);
+  };
+  const closeFind = () => {
+    findBar.hidden = true;
+    textarea.focus();
+  };
+  document.getElementById('codeFindBtn').addEventListener('click', openFind);
+  document.getElementById('codeFindClose').addEventListener('click', closeFind);
+  document.getElementById('codeFindNext').addEventListener('click', () => gotoFindMatch(findIndex + 1, true));
+  document.getElementById('codeFindPrev').addEventListener('click', () => gotoFindMatch(findIndex - 1, true));
+  findCaseBtn.addEventListener('click', () => {
+    findCaseSensitive = !findCaseSensitive;
+    findCaseBtn.classList.toggle('active', findCaseSensitive);
+    computeFindMatches();
+    jumpToNearestMatch(false);
+    findInput.focus();
+  });
+  findInput.addEventListener('input', () => { computeFindMatches(); jumpToNearestMatch(false); });
+  findInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); gotoFindMatch(findIndex + (e.shiftKey ? -1 : 1), true); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeFind(); }
+  });
+  textarea.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); openFind(); }
+  });
+  textarea.addEventListener('input', () => { if (!findBar.hidden) computeFindMatches(); });
   renderHighlight();
 }
 async function saveCodeEditor() {
