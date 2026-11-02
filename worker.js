@@ -3311,14 +3311,26 @@ async function runGithubSyncForSource(source, onFileProgress) {
   }
   if (cur.length) batches.push(cur);
 
-  let done = 0;
-  const failures = [];
-  for (const batch of batches) {
+  const ghSleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const ghPostBatch = async (paths) => {
     const res = await fetch('/api/github-sync/batch', {
       method: 'POST', headers: jsonHeaders(),
-      body: JSON.stringify({ sessionId: prep.sessionId, files: batch.map(f => f.path) })
+      body: JSON.stringify({ sessionId: prep.sessionId, files: paths })
     });
     const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+  let done = 0;
+  let failures = [];
+  for (const batch of batches) {
+    let { res, data } = await ghPostBatch(batch.map(f => f.path));
+    if (!res.ok || !data.ok) {
+      // Whole-request failure (a quota spike or a network hiccup): wait and
+      // retry this batch once before giving up on the whole sync.
+      ghSetSourceStatus(source.id, '请求失败，15 秒后自动重试本批…');
+      await ghSleep(15000);
+      ({ res, data } = await ghPostBatch(batch.map(f => f.path)));
+    }
     if (!res.ok || !data.ok) throw new Error(data.error || '同步中断，再次同步会接着上次的进度继续（已完成的文件会自动跳过）');
     for (const r of (data.results || [])) {
       done++;
@@ -3326,6 +3338,25 @@ async function runGithubSyncForSource(source, onFileProgress) {
     }
     ghSetSourceStatus(source.id, '正在同步 ' + done + ' / ' + files.length + ' 个文件…');
     if (onFileProgress) onFileProgress(done, files.length);
+  }
+  if (failures.length) {
+    // Failures during a long sync are usually a throttling window (GitHub
+    // or D1): waiting it out and retrying just the failed files rescues
+    // most syncs that would otherwise die a few hundred files in.
+    const firstErr = failures[0].error ? '（' + failures[0].error + '）' : '';
+    ghSetSourceStatus(source.id, failures.length + ' 个文件失败' + firstErr + '，30 秒后自动重试…');
+    await ghSleep(30000);
+    const retryPaths = failures.map(f => f.path);
+    failures = [];
+    for (let i = 0; i < retryPaths.length; i += 2) {
+      const chunk = retryPaths.slice(i, i + 2);
+      const { res, data } = await ghPostBatch(chunk);
+      if (!res.ok || !data.ok) { for (const p of chunk) failures.push({ path: p, error: data.error || '重试请求失败' }); continue; }
+      for (const r of (data.results || [])) if (!r.ok) failures.push(r);
+    }
+    if (failures.length) {
+      ghSetSourceStatus(source.id, '重试后仍有 ' + failures.length + ' 个文件失败，下次同步会继续重试');
+    }
   }
 
   const finRes = await fetch('/api/github-sync/finalize', {
@@ -3336,6 +3367,7 @@ async function runGithubSyncForSource(source, onFileProgress) {
   if (!finRes.ok || !fin.ok) throw new Error(fin.error || '同步收尾失败，请重试');
   if (fin.complete === false) {
     const text = '未完全同步：' + (failures.length ? failures.length + ' 个文件失败' : '部分文件未完成') +
+      (failures.length && failures[0].error ? '（' + failures[0].error + '）' : '') +
       '，下次同步会自动重试这些文件';
     ghSetSourceStatus(source.id, text);
     return { state: 'failed', message: label + ' ' + text };
@@ -7198,6 +7230,22 @@ function parseGithubRepoInput(input) {
   return { owner, repo, urlBranch };
 }
 
+async function githubSyncStorageKey(R2, virtualPath) {
+  // UUID-based storage key for synced files. The generic
+  // createStorageKeyForPath proves a plain filename is unreferenced via a
+  // D1 range scan with json_extract — hundreds of rows READ per file once
+  // the drive holds many entries, which drains the free plan's daily
+  // rows-read budget on large syncs (sync stalls after a few hundred
+  // files, then recovers when the window resets). A UUID key is unique by
+  // construction, so an R2 head check is verification enough.
+  const baseName = safeStorageName(virtualPathName(virtualPath) || 'file');
+  for (let i = 0; i < 10; i++) {
+    const key = safeStorageName('file_' + crypto.randomUUID().replace(/-/g, '') + '_' + baseName);
+    if (!await R2.head(key)) return key;
+  }
+  return safeStorageName('file_' + Date.now() + '_' + baseName);
+}
+
 async function githubFetch(url, token, accept) {
   const headers = {
     'User-Agent': 'R2-Cloud-Drive-GitHub-Sync',
@@ -7567,9 +7615,18 @@ async function handleGithubSyncBatch(request, env) {
         // Private repos: fall back to the contents API in raw mode.
         res = await githubFetch(contentsUrl, token, 'application/vnd.github.raw+json');
       }
+      if (!res.ok && (res.status === 429 || res.status >= 500)) {
+        // Throttling or a transient GitHub error: pause briefly and retry
+        // once inside this call instead of failing the file outright.
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        res = await githubFetch(rawUrl, token, '*/*');
+        if (!res.ok && token) {
+          res = await githubFetch(contentsUrl, token, 'application/vnd.github.raw+json');
+        }
+      }
       if (!res.ok) throw new Error('下载失败 HTTP ' + res.status);
       const mime = getMimeType(virtualPath);
-      const storageKey = await createStorageKeyForPath(env, R2, virtualPath, 'file');
+      const storageKey = await githubSyncStorageKey(R2, virtualPath);
       const expectedSize = allowed.get(repoPath);
       let object = null;
       let writtenSize = 0;
