@@ -3257,7 +3257,7 @@ async function addGithubSource() {
     if (!res.ok || !data.ok) throw new Error(data.error || '添加失败');
     document.getElementById('ghRepoInput').value = '';
     document.getElementById('ghTokenInput').value = '';
-    showSnackbar(data.updated ? '该仓库已在列表中，已更新令牌' : '仓库已添加');
+    showSnackbar(data.updated ? '该仓库已在列表中，已更新保存信息' : '仓库已添加');
     await loadGithubSyncSources();
   } catch (err) {
     showSnackbar('添加失败：' + (err?.message || err));
@@ -3331,6 +3331,12 @@ async function runGithubSyncForSource(source, onFileProgress) {
   });
   const fin = await finRes.json().catch(() => ({}));
   if (!finRes.ok || !fin.ok) throw new Error(fin.error || '同步收尾失败，请重试');
+  if (fin.complete === false) {
+    const text = '未完全同步：' + (failures.length ? failures.length + ' 个文件失败' : '部分文件未完成') +
+      '，下次同步会自动重试这些文件';
+    ghSetSourceStatus(source.id, text);
+    return { state: 'failed', message: label + ' ' + text };
+  }
   let text = '同步完成 · ' + fin.fileCount + ' 个文件 · commit ' + String(fin.sha || '').slice(0, 7);
   if (prep.skippedFiles) text += ' · 跳过 ' + prep.skippedFiles + ' 个未变化文件';
   if (fin.deleted) text += ' · 清理 ' + fin.deleted + ' 个已删除文件';
@@ -7149,6 +7155,9 @@ const GITHUB_SYNC_SESSION_PREFIX = 'github_sync:session:';
 const GITHUB_SYNC_SOURCE_PREFIX = 'github_sync:source:';
 const GITHUB_SYNC_MAX_FILES = 5000;
 const GITHUB_SYNC_MAX_FILE_BYTES = 95 * 1024 * 1024;
+// Files at least this large are streamed to R2 instead of buffered whole in
+// the Worker's 128 MB memory (see handleGithubSyncBatch).
+const GITHUB_SYNC_STREAM_MIN_BYTES = 4 * 1024 * 1024;
 
 function githubSyncRecordKey(owner, repo) {
   return GITHUB_SYNC_RECORD_PREFIX + String(owner).toLowerCase() + '/' + String(repo).toLowerCase();
@@ -7248,8 +7257,11 @@ async function handleGithubSyncSources(request, env) {
       s => s.owner.toLowerCase() === parsed.owner.toLowerCase() && s.repo.toLowerCase() === parsed.repo.toLowerCase()
     );
     if (existing) {
-      // One entry per repo: re-adding updates branch/token instead of duplicating.
-      existing.branch = branch;
+      // One entry per repo: re-adding updates instead of duplicating. Only
+      // overwrite branch/token when a new value was actually supplied —
+      // re-adding just to change the token must not reset a branch that was
+      // picked up from a pasted /tree/<branch> link.
+      if (branch) existing.branch = branch;
       if (token) existing.token = token;
       await kvPutJson(env, GITHUB_SYNC_SOURCE_PREFIX + existing.id, existing);
       const record = await kvGetJson(env, githubSyncRecordKey(existing.owner, existing.repo));
@@ -7288,16 +7300,20 @@ async function handleGithubSyncSources(request, env) {
 //   * the file list comes from the jsDelivr data API (GitHub mirror CDN).
 // File contents are still downloaded from raw.githubusercontent.com pinned
 // to the commit SHA, so synced bytes are always exact.
-function parseGitInfoRefs(text) {
+function parseGitInfoRefs(buf) {
+  // pkt-line lengths count BYTES, so parse on the raw buffer and decode each
+  // line separately — slicing a decoded string by character index corrupts
+  // every offset after a multi-byte (e.g. Chinese) branch name.
+  const decoder = new TextDecoder();
   const refs = new Map();
   let headBranch = '';
   let i = 0;
-  while (i + 4 <= text.length) {
-    const len = parseInt(text.slice(i, i + 4), 16);
+  while (i + 4 <= buf.length) {
+    const len = parseInt(decoder.decode(buf.subarray(i, i + 4)), 16);
     if (!Number.isFinite(len)) break;
     if (len === 0) { i += 4; continue; } // flush packet: a section break, refs follow
     if (len < 4) break;
-    const line = text.slice(i + 4, i + len);
+    const line = decoder.decode(buf.subarray(i + 4, i + len));
     i += len;
     const m = /symref=HEAD:refs\/heads\/([^\s]+)/.exec(line);
     if (m) headBranch = m[1];
@@ -7320,12 +7336,14 @@ async function githubHeadInfo(owner, repo) {
     throw new Error('仓库不存在，或私有仓库需要填写访问令牌');
   }
   if (!res.ok) throw new Error('读取仓库信息失败（HTTP ' + res.status + '）');
-  return parseGitInfoRefs(await res.text());
+  return parseGitInfoRefs(new Uint8Array(await res.arrayBuffer()));
 }
 
-async function jsdelivrFileList(owner, repo, branch) {
+async function jsdelivrFileList(owner, repo, ref) {
+  // Pin to the commit SHA, not the branch name: jsDelivr caches branch
+  // resolution for hours, which would pair a fresh SHA with a stale list.
   const url = 'https://data.jsdelivr.com/v1/package/gh/' + encodeURIComponent(owner) + '/' +
-    encodeURIComponent(repo) + '@' + encodeURIComponent(branch) + '/flat';
+    encodeURIComponent(repo) + '@' + encodeURIComponent(ref) + '/flat';
   const res = await fetch(url, { headers: { 'User-Agent': 'R2-Cloud-Drive-GitHub-Sync' } });
   if (!res.ok) throw new Error('文件清单获取失败（HTTP ' + res.status + '）');
   const data = await res.json().catch(() => ({}));
@@ -7394,8 +7412,28 @@ async function handleGithubSyncPrepare(request, env) {
     }
 
     const targetDir = githubSyncTargetDir(owner, repo);
-    const record = await kvGetJson(env, githubSyncRecordKey(owner, repo));
-    if (record && record.sha === sha && !body.force) {
+    let record = await kvGetJson(env, githubSyncRecordKey(owner, repo));
+    // The record key is lowercased but the folder is not: a record written
+    // for a differently-cased owner/repo belongs to a different folder and
+    // says nothing about this one.
+    if (record && record.targetDir && record.targetDir !== targetDir) record = null;
+
+    // Which recorded files are actually still in the drive? A file the user
+    // deleted by hand counts as not synced even when the commit matches —
+    // otherwise "up to date" would strand it forever.
+    let actualPaths = null;
+    if (record && Array.isArray(record.files) && record.files.length) {
+      try {
+        const entries = await listAllFileEntries(env, targetDir);
+        actualPaths = new Set(entries.map(e => e.path.slice(targetDir.length + 1)));
+      } catch { actualPaths = null; }
+    }
+    const recordPaths = record && Array.isArray(record.files)
+      ? record.files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean)
+      : [];
+    const missingCount = actualPaths ? recordPaths.filter(p => !actualPaths.has(p)).length : 0;
+
+    if (record && record.sha === sha && !body.force && missingCount === 0) {
       return jsonResponse({
         ok: true, upToDate: true, owner, repo, branch, sha, targetDir,
         fileCount: record.fileCount || (Array.isArray(record.files) ? record.files.length : 0),
@@ -7408,7 +7446,7 @@ async function handleGithubSyncPrepare(request, env) {
       files = await githubTreeFileList(apiBase, sha, token);
     } else {
       try {
-        files = await jsdelivrFileList(owner, repo, branch);
+        files = await jsdelivrFileList(owner, repo, sha);
       } catch {
         // Last resort: the REST API tree (may itself be quota-blocked).
         try {
@@ -7435,7 +7473,8 @@ async function handleGithubSyncPrepare(request, env) {
       }
     }
     const changedFiles = files.filter(f =>
-      !prevBlobs.has(f.path) || !f.blob || prevBlobs.get(f.path) !== f.blob
+      !prevBlobs.has(f.path) || !f.blob || prevBlobs.get(f.path) !== f.blob ||
+      (actualPaths && !actualPaths.has(f.path)) // deleted in the drive → restore it
     );
     const skippedFiles = files.length - changedFiles.length;
     const sessionId = crypto.randomUUID();
@@ -7483,27 +7522,53 @@ async function handleGithubSyncBatch(request, env) {
       const virtualPath = assertVirtualPath(session.targetDir + '/' + repoPath);
       const encodedPath = repoPath.split('/').map(encodeURIComponent).join('/');
       const ghBase = encodeURIComponent(session.owner) + '/' + encodeURIComponent(session.repo);
-      let res = await githubFetch(
-        'https://raw.githubusercontent.com/' + ghBase + '/' + encodeURIComponent(session.sha) + '/' + encodedPath,
-        token, '*/*'
-      );
+      const rawUrl = 'https://raw.githubusercontent.com/' + ghBase + '/' + encodeURIComponent(session.sha) + '/' + encodedPath;
+      const contentsUrl = 'https://api.github.com/repos/' + ghBase + '/contents/' + encodedPath +
+        '?ref=' + encodeURIComponent(session.sha);
+      let res = await githubFetch(rawUrl, token, '*/*');
       if (!res.ok && token) {
         // Private repos: fall back to the contents API in raw mode.
-        res = await githubFetch(
-          'https://api.github.com/repos/' + ghBase + '/contents/' + encodedPath + '?ref=' + encodeURIComponent(session.sha),
-          token, 'application/vnd.github.raw+json'
-        );
+        res = await githubFetch(contentsUrl, token, 'application/vnd.github.raw+json');
       }
       if (!res.ok) throw new Error('下载失败 HTTP ' + res.status);
-      const bytes = await res.arrayBuffer();
       const mime = getMimeType(virtualPath);
       const storageKey = await createStorageKeyForPath(env, R2, virtualPath, 'file');
-      const object = await R2.put(storageKey, bytes, { httpMetadata: { contentType: mime } });
+      const expectedSize = allowed.get(repoPath);
+      let object = null;
+      let writtenSize = 0;
+      let bodyConsumed = false;
+      if (expectedSize >= GITHUB_SYNC_STREAM_MIN_BYTES && res.body &&
+          typeof FixedLengthStream === 'function') {
+        // Large file: stream it through to R2 instead of buffering the whole
+        // body in the Worker's 128 MB memory. R2 stream uploads need an exact
+        // length, which FixedLengthStream enforces against the listing size
+        // (the Content-Length header is useless here — it counts the gzipped
+        // transfer, not the file). A size mismatch aborts the put, and the
+        // buffered fallback below then handles the file instead.
+        bodyConsumed = true;
+        try {
+          object = await R2.put(storageKey, res.body.pipeThrough(new FixedLengthStream(expectedSize)), {
+            httpMetadata: { contentType: mime }
+          });
+          writtenSize = expectedSize;
+        } catch { object = null; }
+      }
+      if (!object) {
+        if (bodyConsumed) {
+          // The failed stream attempt used up the response body: fetch again.
+          res = await githubFetch(rawUrl, token, '*/*');
+          if (!res.ok && token) res = await githubFetch(contentsUrl, token, 'application/vnd.github.raw+json');
+          if (!res.ok) throw new Error('下载失败 HTTP ' + res.status);
+        }
+        const bytes = await res.arrayBuffer();
+        object = await R2.put(storageKey, bytes, { httpMetadata: { contentType: mime } });
+        writtenSize = bytes.byteLength;
+      }
       await replaceFileEntry(env, R2, fileEntryFromR2Meta(virtualPath, storageKey, object, {
         contentType: mime,
         storageType: 'r2'
       }));
-      results.push({ path: repoPath, ok: true, size: bytes.byteLength });
+      results.push({ path: repoPath, ok: true, size: writtenSize });
     } catch (err) {
       results.push({ path: repoPath, ok: false, error: err?.message || '同步失败' });
     }
@@ -7559,21 +7624,40 @@ async function handleGithubSyncFinalize(request, env, ctx) {
       deleted = result?.deleted ?? removed.length;
     }
   }
+  // Reconcile with the progress that batch calls merged into the record:
+  // a file only counts as synced if its content hash actually landed there.
+  // Files that failed (or were never attempted) keep an EMPTY hash and the
+  // record's commit sha is NOT advanced, so the next prepare will retry
+  // exactly those files instead of reporting "up to date" forever.
+  const progress = new Map();
+  if (previous && Array.isArray(previous.files)) {
+    for (const f of previous.files) {
+      if (typeof f === 'string') progress.set(f, '');
+      else if (f && f.path) progress.set(f.path, f.blob || '');
+    }
+  }
+  let allOk = true;
+  const recordFiles = (session.files || []).map(f => {
+    const ok = f.blob ? progress.get(f.path) === f.blob : progress.has(f.path);
+    if (!ok) allOk = false;
+    return { path: f.path, blob: ok ? (f.blob || '') : '' };
+  });
   const record = {
     owner: session.owner,
     repo: session.repo,
     branch: session.branch,
-    sha: session.sha,
+    sha: allOk ? session.sha : (previous?.sha || ''),
     targetDir: session.targetDir,
-    files: (session.files || []).map(f => ({ path: f.path, blob: f.blob || '' })),
-    fileCount: (session.files || []).length,
-    syncedAt: new Date().toISOString()
+    files: recordFiles,
+    fileCount: allOk ? recordFiles.length : (previous?.fileCount || 0),
+    syncedAt: allOk ? new Date().toISOString() : (previous?.syncedAt || '')
   };
   await kvPutJson(env, recordKey, record);
   await kvDelete(env, GITHUB_SYNC_SESSION_PREFIX + sessionId);
   return jsonResponse({
-    ok: true, sha: session.sha, targetDir: session.targetDir,
-    fileCount: record.fileCount, deleted
+    ok: true, complete: allOk, sha: record.sha, targetDir: session.targetDir,
+    fileCount: record.fileCount, deleted,
+    pendingFiles: recordFiles.filter(f => !f.blob).length
   });
 }
 
