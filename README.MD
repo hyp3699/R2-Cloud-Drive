@@ -138,6 +138,7 @@
 | `LOGIN_BACKGROUND_URL`   | 登录页背景图片链接                                                  | 可选     | 淡灰色背景       |
 | `STORAGE_NODE_TOKEN`     | 存储节点密钥，节点 Worker 用于接收主控上传分片                      | 可选     | 无               |
 | `DOWNLOAD_RANGE_SIZE_MB` | 服务端拼接分布式文件时的内部读取片段大小（MiB），范围 1~32，默认 32 | 可选     | 32               |
+| `STORAGE_LIMIT_MB`       | 限制上传到储存桶总文件大小 | 可选     |                |
 
 设置方法：
 
