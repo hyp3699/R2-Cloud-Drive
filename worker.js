@@ -4013,6 +4013,24 @@ let notesCache = [];
 let notesLoadedAt = 0;
 let notesLoading = false;
 let currentNote = null; // { name, etag, isNew }
+// 标题和摘要缓存到本机：再次进入时直接显示正确标题，不用等内容拉下来
+const NOTES_META_KEY = 'notesMetaCache_v1';
+try {
+  const saved = JSON.parse(localStorage.getItem(NOTES_META_KEY) || '[]');
+  if (Array.isArray(saved)) notesCache = saved.filter(n => n && n.name).map(n => ({ name: n.name, uploaded: n.uploaded, size: n.size, title: n.title || '', snippet: n.snippet || '', content: null }));
+} catch {}
+function noteSnippetFromContent(content) {
+  return String(content || '').split('\\n').map(t => t.trim()).filter(t => t).slice(1, 2).join(' ');
+}
+function saveNotesMeta() {
+  try {
+    localStorage.setItem(NOTES_META_KEY, JSON.stringify(notesCache.map(n => ({
+      name: n.name, uploaded: n.uploaded, size: n.size,
+      title: n.content !== null ? noteTitleFromContent(n.content, '') : (n.title || ''),
+      snippet: (n.content !== null ? noteSnippetFromContent(n.content) : (n.snippet || '')).slice(0, 80)
+    }))));
+  } catch {}
+}
 function openNotes() {
   document.getElementById('notesModal')?.classList.add('open');
   showNotesList();
@@ -4050,7 +4068,10 @@ async function loadNotes(background, force) {
     notesCache = files.map(f => {
       const old = oldByName.get(f.name);
       if (old && old.size === f.size && old.uploaded === f.uploaded) return old;
-      return { name: f.name, uploaded: f.uploaded, size: f.size, content: null };
+      // 内容变了也先沿用旧标题顶着，内容拉下来再更新
+      const oldTitle = old ? (old.content !== null ? noteTitleFromContent(old.content, '') : old.title) : '';
+      const oldSnippet = old ? (old.content !== null ? noteSnippetFromContent(old.content) : old.snippet) : '';
+      return { name: f.name, uploaded: f.uploaded, size: f.size, title: oldTitle || '', snippet: oldSnippet || '', content: null };
     });
     notesLoadedAt = Date.now();
     renderNotesList();
@@ -4072,6 +4093,7 @@ async function loadNotes(background, force) {
       await Promise.all(Array.from({ length: Math.min(4, missing.length) }, worker));
       renderNotesList();
     }
+    saveNotesMeta();
   } catch (err) {
     if (!notesCache.length) list.innerHTML = '<div class="note-empty">加载失败：' + escapeHtml(err.message || '未知错误') + '</div>';
   } finally { notesLoading = false; }
@@ -4085,8 +4107,8 @@ function renderNotesList() {
   }
   list.innerHTML = notesCache.map(n => {
     const base = n.name.replace(/\\.txt$/i, '');
-    const title = noteTitleFromContent(n.content, base);
-    const snippet = String(n.content || '').split('\\n').map(t => t.trim()).filter(t => t).slice(1, 2).join(' ');
+    const title = n.content !== null ? noteTitleFromContent(n.content, base) : (n.title || base);
+    const snippet = n.content !== null ? noteSnippetFromContent(n.content) : (n.snippet || '');
     const meta = (n.uploaded ? formatDate(n.uploaded) : '') + (snippet ? ' · ' + snippet : '');
     // 文件名进 onclick 属性时把双引号转成 &quot;，浏览器解析属性后会还原，带引号的文件名也不会断掉
     return '<div class="note-row" onclick="openNoteEditor(' + JSON.stringify(n.name).replace(/"/g, '&quot;') + ')">' +
@@ -4114,7 +4136,8 @@ async function openNoteEditor(name) {
   }
   const note = notesCache.find(n => n.name === name);
   currentNote = { name, etag: '', isNew: false };
-  titleEl.textContent = noteTitleFromContent(note?.content, name.replace(/\\.txt$/i, ''));
+  const fallbackTitle = name.replace(/\\.txt$/i, '');
+  titleEl.textContent = note && note.content === null ? (note.title || fallbackTitle) : noteTitleFromContent(note?.content, fallbackTitle);
   textEl.value = note?.content || '';
   // 取 etag，供保存时 If-Match 用（拿不到也不影响保存）
   try {
@@ -4123,12 +4146,12 @@ async function openNoteEditor(name) {
   } catch {}
   // 不自动聚焦：点一下内容框再弹输入法
 }
-function noteFileNameFor(content) {
+function noteFileNameFor(content, exceptName) {
   const first = String(content || '').split('\\n').map(t => t.trim()).find(t => t) || '';
   let base = first.replace(/[\\/\\\\:*?"<>|]/g, '').replace(/\\s+/g, ' ').trim().slice(0, 30) || ('未命名笔记_' + new Date().toISOString().slice(0, 10));
   let name = base + '.txt';
   let i = 2;
-  const taken = new Set(notesCache.map(n => n.name));
+  const taken = new Set(notesCache.map(n => n.name).filter(n => n !== exceptName));
   while (taken.has(name)) { name = base + ' (' + (i++) + ').txt'; }
   return name;
 }
@@ -4155,6 +4178,23 @@ async function saveCurrentNote() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || '保存失败');
       if (data.etag) currentNote.etag = data.etag;
+      // 第一行改了就把文件名一起改掉，以后进来标题就不会先闪旧名字
+      const oldName = currentNote.name;
+      const newName = noteFileNameFor(content, oldName);
+      const stripSuffix = n => n.replace(/\\.txt$/i, '').replace(/ \\(\\d+\\)$/, '');
+      if (newName !== oldName && stripSuffix(newName) !== stripSuffix(oldName)) {
+        try {
+          const rr = await fetch('/api/rename', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ from: NOTES_FOLDER + '/' + oldName, to: NOTES_FOLDER + '/' + newName }) });
+          if (rr.ok) {
+            const cached = notesCache.find(n => n.name === oldName);
+            if (cached) cached.name = newName;
+            currentNote.name = newName;
+          }
+        } catch {}
+      }
+      const cachedNote = notesCache.find(n => n.name === currentNote.name);
+      if (cachedNote) { cachedNote.content = content; cachedNote.title = noteTitleFromContent(content, ''); }
+      saveNotesMeta();
       showSnackbar('笔记已保存');
     }
     showNotesList();
@@ -10809,7 +10849,16 @@ export default {
     if (path === '/api/rename' && request.method === 'POST') {
       const { from, to } = await request.json().catch(() => ({}));
       if (!from || !to) return new Response('Missing fields', { status: 400 });
-      if (isNotesPath(from) || isNotesPath(to)) return jsonResponse({ ok: false, error: 'notes are private' }, 400);
+      const noteFile = p => {
+        const c = normalizeVirtualPath(p);
+        return c.startsWith(NOTES_FOLDER_NAME + '/') && !c.slice(NOTES_FOLDER_NAME.length + 1).includes('/') && c.toLowerCase().endsWith('.txt');
+      };
+      // 笔记改了第一行后要跟着改文件名：只允许「笔记」文件夹里的 .txt 改成同一文件夹里的另一个 .txt，且不覆盖已有笔记
+      const isNoteRename = noteFile(from) && noteFile(to);
+      if (!isNoteRename && (isNotesPath(from) || isNotesPath(to))) return jsonResponse({ ok: false, error: 'notes are private' }, 400);
+      if (isNoteRename && normalizeVirtualPath(from) !== normalizeVirtualPath(to) && await getFileEntry(env, normalizeVirtualPath(to))) {
+        return jsonResponse({ ok: false, error: 'destination exists' }, 409);
+      }
       try {
         await moveVirtualPath(env, R2, from, to);
         return Response.json({ ok: true });
