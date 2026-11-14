@@ -1239,13 +1239,13 @@ ${content}
   <div class="context-menu-item" onclick="ctxRename()">
     <span class="material-icons-round">drive_file_rename_outline</span><span>重命名</span>
   </div>
-  <div class="context-menu-item" onclick="ctxCopyLink()">
+  <div class="context-menu-item" id="ctxCopyLinkItem" onclick="ctxCopyLink()">
     <span class="material-icons-round">link</span><span>复制链接</span>
   </div>
-  <div class="context-menu-item" onclick="ctxCloseDirectLink()">
-    <span class="material-icons-round">link_off</span><span>关闭直连</span>
+  <div class="context-menu-item" id="ctxDirectToggle" onclick="ctxToggleDirectLink()">
+    <span class="material-icons-round" id="ctxDirectIcon">link_off</span><span id="ctxDirectText">已关闭直连点击开启</span>
   </div>
-  <div class="context-menu-item" onclick="ctxResetDirectLink()">
+  <div class="context-menu-item" id="ctxResetDirectItem" onclick="ctxResetDirectLink()">
     <span class="material-icons-round">refresh</span><span>重置直连</span>
   </div>
   <div class="context-menu-divider"></div>
@@ -2702,11 +2702,17 @@ async function deleteSelectedOrphans() {
 }
 
 // ── Context Menu ──
-function showCtxMenu(e, name) {
+function showCtxMenu(e, name, isFolder) {
   e.preventDefault(); e.stopPropagation();
   ctxTarget = name;
   const menu = document.getElementById('contextMenu');
   if (!menu) return;
+  // 直连只对文件有效：文件夹不显示这三项；文件打开菜单时查一下当前直连状态
+  ['ctxCopyLinkItem', 'ctxDirectToggle', 'ctxResetDirectItem'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = isFolder ? 'none' : '';
+  });
+  if (!isFolder) refreshCtxDirectState(currentPath ? currentPath + '/' + name : name);
 
   // 先让菜单可见并移到屏幕外，以便测量真实尺寸
   menu.classList.add('open');
@@ -2802,18 +2808,78 @@ function ctxRename() {
   fetch('/api/rename', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({from: oldPath, to: newPath}) })
     .then(r => r.ok ? (showSnackbar('已重命名'), location.reload()) : showSnackbar('重命名失败'));
 }
+// 直连默认关闭：右键菜单里显示当前状态，点一下切换
+let ctxDirectState = { path: '', enabled: false, seq: 0 };
+function setCtxDirectToggle(enabled, loading) {
+  const item = document.getElementById('ctxDirectToggle');
+  const icon = document.getElementById('ctxDirectIcon');
+  const text = document.getElementById('ctxDirectText');
+  if (!item || !icon || !text) return;
+  if (loading) { item.classList.remove('danger'); icon.textContent = 'link'; text.textContent = '正在查询直连状态…'; return; }
+  item.classList.toggle('danger', !!enabled);
+  icon.textContent = enabled ? 'link_off' : 'link';
+  text.textContent = enabled ? '已开启直连点击关闭' : '已关闭直连点击开启';
+}
+async function refreshCtxDirectState(path) {
+  const seq = ++ctxDirectState.seq;
+  ctxDirectState.path = path;
+  ctxDirectState.enabled = false;
+  ctxDirectState.known = false;
+  setCtxDirectToggle(false, true);
+  try {
+    const res = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
+    const data = await res.json().catch(() => ({}));
+    if (seq !== ctxDirectState.seq) return;
+    ctxDirectState.enabled = !!(res.ok && data.enabled && data.url);
+  } catch {
+    if (seq !== ctxDirectState.seq) return;
+  }
+  ctxDirectState.known = true;
+  setCtxDirectToggle(ctxDirectState.enabled, false);
+}
+async function ctxToggleDirectLink() {
+  if (!ctxTarget) return;
+  const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
+  // 状态还没查回来时先查一次，避免点错方向
+  if (ctxDirectState.path !== path || !ctxDirectState.known) {
+    try {
+      const r = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
+      const d = await r.json().catch(() => ({}));
+      ctxDirectState = { path, enabled: !!(r.ok && d.enabled && d.url), known: true, seq: ctxDirectState.seq + 1 };
+    } catch {}
+  }
+  if (ctxDirectState.enabled) {
+    try {
+      const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'close' }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'close failed');
+      ctxDirectState.enabled = false;
+      showSnackbar('直连已关闭，旧链接立即失效');
+    } catch (err) {
+      showSnackbar('关闭直连失败：' + (err.message || '未知错误'));
+    }
+  } else {
+    try {
+      const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'enable' }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.url) throw new Error(data.error || 'enable failed');
+      ctxDirectState.enabled = true;
+      try { await navigator.clipboard.writeText(location.origin + data.url); showSnackbar('直连已开启，链接已复制'); }
+      catch { showSnackbar('直连已开启，可在「复制链接」里复制'); }
+    } catch (err) {
+      showSnackbar('开启直连失败：' + (err.message || '未知错误'));
+    }
+  }
+}
 async function ctxCopyLink() {
   if (!ctxTarget) return;
   const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
   try {
-    let res = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
-    let data = await res.json().catch(() => ({}));
+    const res = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'direct link failed');
-    if (!data.enabled || !data.url) {
-      res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'enable' }) });
-      data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.url) throw new Error(data.error || 'direct link failed');
-    }
+    // 直连默认关闭：复制链接不再自动开启
+    if (!data.enabled || !data.url) { showSnackbar('该文件直连未开启，请先点「已关闭直连点击开启」'); return; }
     const url = location.origin + data.url;
     await navigator.clipboard.writeText(url).catch(function() {});
     showSnackbar('直连链接已复制，关闭或重置后旧链接立即失效');
@@ -2821,22 +2887,12 @@ async function ctxCopyLink() {
     showSnackbar('复制直连失败：' + (err.message || '未知错误'));
   }
 }
-async function ctxCloseDirectLink() {
-  if (!ctxTarget) return;
-  const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
-  try {
-    const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'close' }) });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'close failed');
-    showSnackbar(data.existed ? '直连已关闭，旧链接立即失效' : '该文件直连未开启，无需关闭');
-  } catch (err) {
-    showSnackbar('关闭直连失败：' + (err.message || '未知错误'));
-  }
-}
 async function ctxResetDirectLink() {
   if (!ctxTarget) return;
   const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
   try {
+    const cur = await fetch('/api/direct-link?path=' + encodeURIComponent(path)).then(r => r.json()).catch(() => ({}));
+    if (!cur.enabled) { showSnackbar('该文件直连未开启，无需重置'); return; }
     const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'reset' }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.url) throw new Error(data.error || 'reset failed');
@@ -5275,7 +5331,7 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
     const renderFolderCard = (name) => {
     const href = '/?path=' + encodeURIComponent(currentPath ? currentPath + '/' + name : name);
     return `<div class="file-card" data-name="${escapeAttr(name)}" data-size="0" onclick="${jsAttr(`handleFolderClick(event, ${jsString(name)}, ${jsString(href)})`)}"
-        oncontextmenu="${jsAttr(`showCtxMenu(event, ${jsString(name)})`)}">
+        oncontextmenu="${jsAttr(`showCtxMenu(event, ${jsString(name)}, true)`)}">
       <div class="file-card-top">
         <button class="row-check" type="button" title="选择" onclick="${jsAttr(`event.stopPropagation();toggleSelect(${jsString(name)})`)}"><span class="material-icons-round">check</span></button>
       </div>
@@ -5285,7 +5341,7 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
       <div class="file-card-name">${escapeHtml(name)}</div>
       <div class="file-card-meta"><span>文件夹</span></div>
       <div class="file-card-actions">
-        <button class="icon-btn" title="更多" onclick="${jsAttr(`event.stopPropagation();showCtxMenu(event, ${jsString(name)})`)}">
+        <button class="icon-btn" title="更多" onclick="${jsAttr(`event.stopPropagation();showCtxMenu(event, ${jsString(name)}, true)`)}">
           <span class="material-icons-round">more_vert</span>
         </button>
       </div>
@@ -5331,7 +5387,7 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
       <td class="file-row-meta">—</td>
       <td class="file-row-meta">—</td>
       <td><div class="file-row-actions">
-        <button class="icon-btn" title="更多" onclick="${jsAttr(`event.stopPropagation();showCtxMenu(event, ${jsString(name)})`)}">
+        <button class="icon-btn" title="更多" onclick="${jsAttr(`event.stopPropagation();showCtxMenu(event, ${jsString(name)}, true)`)}">
           <span class="material-icons-round">more_vert</span>
         </button>
       </div></td>
