@@ -3920,7 +3920,7 @@ function setNodeFormType(type) {
   const label = document.getElementById('nodeUrlLabel');
   const url = document.getElementById('nodeUrlInput');
   const hint = document.getElementById('nodeFormHint');
-  if (label) label.textContent = isDav ? 'WebDAV 地址（含存放目录）' : '节点 Worker 地址';
+  if (label) label.textContent = isDav ? 'WebDAV 地址（含存放目录）' : '存储桶 Worker 地址';
   if (url) url.placeholder = isDav ? 'https://dav.jianguoyun.com/dav/R2网盘' : 'https://node.example.workers.dev';
   if (hint) hint.textContent = isDav
     ? '坚果云、Nextcloud、Alist 等支持 WebDAV 的网盘都可以。目录不存在会自动创建；坚果云要用「第三方应用管理」里生成的应用密码。大文件分片会经主控 Worker 中转存过去。'
@@ -4030,7 +4030,7 @@ function renderStorageNodes(nodes, at) {
     title.textContent = node.name || node.id || '';
     const badge = document.createElement('span');
     badge.className = 'node-badge' + (isDav ? ' webdav' : '');
-    badge.textContent = isMain ? 'R2 主控' : (isDav ? 'WebDAV' : 'Worker');
+    badge.textContent = isMain ? 'R2 主控' : (isDav ? 'WebDAV' : 'R2 存储桶');
     title.appendChild(badge);
     if (!isMain && node.online === false) {
       const off = document.createElement('span');
@@ -4132,8 +4132,15 @@ async function saveStorageNode() {
   }
 }
 async function deleteStorageNode(id) {
-  if (!confirm('确定删除这个存储节点？\\n已经存到这个节点上的文件分片会读不到。')) return;
+  if (!confirm('确定删除这个存储节点？')) return;
+  showSnackbar('正在检查节点上的文件...');
   const res = await fetch('/api/storage-nodes?id=' + encodeURIComponent(id), { method: 'DELETE', headers: CSRF_HEADER });
+  if (res.status === 409) {
+    const data = await res.json().catch(() => ({}));
+    const list = (data.samples || []).map(p => '· ' + p).join('\\n');
+    alert('不能删除：这个节点上还有 ' + (data.count || 0) + ' 个网盘文件（' + formatSize(data.bytes || 0) + '）。\\n先在网盘里删掉这些文件再删节点（移动文件不会把数据搬离节点）。' + (list ? '\\n\\n' + list + ((data.count || 0) > (data.samples || []).length ? '\\n……' : '') : ''));
+    return;
+  }
   showSnackbar(res.ok ? '节点已删除' : '删除节点失败');
   if (res.ok) {
     const c = readNodesCache();
@@ -6282,7 +6289,7 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
       <div class="node-form-panel" id="nodeFormPanel">
         <div class="node-type-switch">
           <button type="button" class="chip active" id="nodeTypeWorker" onclick="setNodeFormType('worker')">
-            <span class="material-icons-round">cloud</span> Worker 节点
+            <span class="material-icons-round">cloud</span> R2 存储桶
           </button>
           <button type="button" class="chip" id="nodeTypeWebdav" onclick="setNodeFormType('webdav')">
             <span class="material-icons-round">dns</span> WebDAV 网盘
@@ -6294,7 +6301,7 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
             <input class="text-field" id="nodeNameInput" type="text" placeholder="账号 A">
           </div>
           <div class="full">
-            <label class="field-label" for="nodeUrlInput" id="nodeUrlLabel">节点 Worker 地址</label>
+            <label class="field-label" for="nodeUrlInput" id="nodeUrlLabel">存储桶 Worker 地址</label>
             <input class="text-field" id="nodeUrlInput" type="url" placeholder="https://node.example.workers.dev">
           </div>
           <div class="full node-field-worker">
@@ -6506,6 +6513,8 @@ const FS_FILE_PREFIX = 'r2drive:fs:file:';
 const FS_FOLDER_PREFIX = 'r2drive:fs:folder:';
 const FS_DIR_PREFIX = 'r2drive:fs:dir:';
 const NODE_PART_PREFIX = 'r2drive_node_part_';
+// 存到其他 R2 存储桶 / WebDAV 的文件统一放在这个文件夹里
+const NODE_DATA_FOLDER = 'R2网盘';
 const STORAGE_NODE_USAGE_PREFIX = 'storage_node_usage:';
 const SHARE_LINK_PREFIX = 'share_link:';
 const SHARE_AUTH_COOKIE_PREFIX = 'r2drive_share_';
@@ -6735,7 +6744,7 @@ function webdavMirrorPath(vpath, suffix = '') {
     const ext = dot > 0 ? name.slice(dot) : '';
     segs.push(stem + ' (' + suffix + ')' + ext);
   }
-  return segs.join('/');
+  return NODE_DATA_FOLDER + '/' + segs.join('/');
 }
 
 function webdavPartKey(root, partNumber, totalParts) {
@@ -8593,6 +8602,25 @@ async function listAllFileEntries(env, folderPath = '') {
     ...directFiles.filter(Boolean),
     ...nestedFiles
   ].map(entry => ({ ...entry, path: normalizeVirtualPath(entry.path), name: entry.name || virtualPathName(entry.path) }));
+}
+
+// 找出分片存在某个节点上的网盘文件（读每个分片文件的清单）
+async function findNodeFileRefs(env, R2, nodeId) {
+  const entries = (await listAllFileEntries(env, '')).filter(e => e.storageKey && (!e.storageType || e.storageType === 'distributed'));
+  const result = { count: 0, bytes: 0, samples: [] };
+  await mapWithConcurrency(entries, 16, async entry => {
+    const obj = await R2.get(entry.storageKey).catch(() => null);
+    if (!obj) return;
+    if (!hasManifestMetadata(obj)) { await discardBody(obj); return; }
+    const manifest = await readManifestObject(obj).catch(() => null);
+    if (!isManifestFile(manifest)) return;
+    const parts = manifest.parts.filter(p => p.nodeId === nodeId);
+    if (!parts.length) return;
+    result.count++;
+    result.bytes += parts.reduce((sum, p) => sum + (Number(p.size) || 0), 0);
+    if (result.samples.length < 5) result.samples.push(entry.path);
+  });
+  return result;
 }
 
 async function listFolderPaths(env, folderPath = '') {
@@ -11281,6 +11309,18 @@ export default {
         const id = url.searchParams.get('id');
         if (!id) return jsonResponse({ ok: false, error: 'missing id' }, 400);
         const nodes = await getStorageNodes(env, true);
+        // 节点上还有网盘文件时不让删，避免文件读不到
+        const refs = await findNodeFileRefs(env, R2, id);
+        if (refs.count > 0) {
+          return jsonResponse({
+            ok: false,
+            code: 'NODE_IN_USE',
+            count: refs.count,
+            bytes: refs.bytes,
+            samples: refs.samples,
+            error: '这个节点上还有 ' + refs.count + ' 个文件，先把它们删掉再删节点'
+          }, 409);
+        }
         await saveStorageNodes(env, nodes.filter(node => node.id !== id));
         return jsonResponse({ ok: true });
       } catch (err) {
@@ -11819,7 +11859,7 @@ export default {
         const dav = davRoots.get(node.id);
         const partKey = dav
           ? webdavPartKey(dav.root, partNumber, totalParts)
-          : NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
+          : NODE_DATA_FOLDER + '/' + NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
         const partSize = partSizes[partNumber - 1];
         const isMain = node.id === MAIN_STORAGE_NODE_ID || node.storageType === 'r2';
         const isDav = !isMain && node.type === 'webdav';
@@ -12095,7 +12135,7 @@ export default {
             const g = groups.get(id) || {
               id,
               name: id === MAIN_STORAGE_NODE_ID ? '主控 R2' : (node?.name || part.nodeName || id),
-              kind: id === MAIN_STORAGE_NODE_ID ? 'R2' : ((node?.type || part.nodeType) === 'webdav' ? 'WebDAV' : 'Worker 节点') + (node ? '' : ' · 已删除'),
+              kind: id === MAIN_STORAGE_NODE_ID ? 'R2' : ((node?.type || part.nodeType) === 'webdav' ? 'WebDAV' : 'R2 存储桶') + (node ? '' : ' · 已删除'),
               parts: 0,
               bytes: 0
             };
