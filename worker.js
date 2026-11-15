@@ -4281,9 +4281,9 @@ function downloadNodeFile(o) {
   a.remove();
 }
 async function deleteNodeFile(o) {
-  const isPart = /^r2drive_/.test(o.key);
+  const isPart = /^r2drive_/.test(o.key) || r2fileViewNodeType === 'webdav';
   let msg = '确定删除' + (o.isDir ? '文件夹' : '') + '「' + o.key + '」？' + (o.isDir ? '里面的内容会一起删掉。' : '');
-  if (isPart) msg += '这是网盘自己存的分片/索引，删掉后对应的网盘文件会损坏。';
+  if (isPart) msg += '如果它是网盘里某个文件的数据，删掉后网盘里的那个文件会打不开。';
   if (!confirm(msg)) return;
   const res = await fetch(nodeFileUrl(o, false) + (o.isDir ? '&dir=1' : ''), { method: 'DELETE', headers: CSRF_HEADER });
   const data = await res.json().catch(() => ({}));
@@ -6708,8 +6708,226 @@ function webdavAuthHeaders(node, extra = {}) {
   return headers;
 }
 
+// key 里的 / 是目录分隔，按段编码
+function webdavKeyPath(key) {
+  return String(key || '').split('/').map(encodeURIComponent).join('/');
+}
+
 function webdavObjectUrl(node, key) {
-  return normalizeNodeUrl(node.url) + '/' + encodeURIComponent(String(key || ''));
+  return normalizeNodeUrl(node.url) + '/' + webdavKeyPath(key);
+}
+
+// ── WebDAV 节点上按网盘路径存放 ──
+// 单分片文件：<节点目录>/<网盘路径>；多分片文件：<节点目录>/<网盘路径>/001、002…
+// 同名冲突时文件名加「 (xxxx)」。网盘里重命名 / 移动时，节点上用 MOVE 跟着改。
+function webdavSafeSegment(seg) {
+  const cleaned = String(seg || '').replace(/[\x00-\x1f\\:*?"<>|]/g, '_').replace(/[. ]+$/g, '');
+  return cleaned || '_';
+}
+
+function webdavMirrorPath(vpath, suffix = '') {
+  const segs = String(vpath || '').split('/').filter(Boolean).map(webdavSafeSegment);
+  if (!segs.length) return '';
+  if (suffix) {
+    const name = segs.pop();
+    const dot = name.lastIndexOf('.');
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    segs.push(stem + ' (' + suffix + ')' + ext);
+  }
+  return segs.join('/');
+}
+
+function webdavPartKey(root, partNumber, totalParts) {
+  if (totalParts <= 1) return root;
+  return root + '/' + String(partNumber).padStart(Math.max(3, String(totalParts).length), '0');
+}
+
+function webdavParentKey(key) {
+  const segs = String(key || '').split('/').filter(Boolean);
+  segs.pop();
+  return segs.join('/');
+}
+
+async function webdavPathExists(node, key) {
+  const res = await webdavPropfind(node, webdavObjectUrl(node, key), 0, WEBDAV_LIST_PROPFIND).catch(() => null);
+  await discardBody(res);
+  return !!res && (res.status === 207 || res.status === 200 || res.status === 301);
+}
+
+// 建好 key 的所有上级目录（节点目录本身由 ensureWebdavDir 负责）
+async function ensureWebdavParents(node, key) {
+  const parent = webdavParentKey(key);
+  if (!parent) return;
+  const probe = await webdavPropfind(node, webdavObjectUrl(node, parent) + '/', 0, WEBDAV_LIST_PROPFIND).catch(() => null);
+  await discardBody(probe);
+  if (probe && (probe.status === 207 || probe.status === 200)) return;
+  const segs = parent.split('/');
+  for (let i = 1; i <= segs.length; i++) {
+    const dir = segs.slice(0, i).join('/');
+    const res = await fetch(webdavObjectUrl(node, dir) + '/', { method: 'MKCOL', headers: webdavAuthHeaders(node) }).catch(() => null);
+    await discardBody(res);
+    if (i === segs.length && !(res && (res.ok || res.status === 405))) {
+      throw new Error('WebDAV 创建目录失败（' + dir + '，HTTP ' + (res ? res.status : '网络错误') + '）');
+    }
+  }
+}
+
+// 删掉 key 往上已经空了的目录（不碰节点目录本身）
+async function cleanupWebdavEmptyParents(node, key) {
+  let dir = webdavParentKey(key);
+  for (let depth = 0; dir && depth < 8; depth++) {
+    const res = await webdavPropfind(node, webdavObjectUrl(node, dir) + '/', 1, WEBDAV_LIST_PROPFIND).catch(() => null);
+    if (!res || res.status !== 207) { await discardBody(res); return; }
+    const xml = await res.text();
+    const count = (xml.match(/<(?:[A-Za-z0-9_-]+:)?response[\s>]/gi) || []).length;
+    if (count > 1) return;
+    const del = await fetch(webdavObjectUrl(node, dir) + '/', { method: 'DELETE', headers: webdavAuthHeaders(node) }).catch(() => null);
+    await discardBody(del);
+    if (!del || !(del.ok || del.status === 404)) return;
+    dir = webdavParentKey(dir);
+  }
+}
+
+async function webdavMove(node, fromKey, toKey, isDir) {
+  const tail = isDir ? '/' : '';
+  const res = await fetch(webdavObjectUrl(node, fromKey) + tail, {
+    method: 'MOVE',
+    headers: webdavAuthHeaders(node, { Destination: webdavObjectUrl(node, toKey) + tail, Overwrite: 'F' })
+  }).catch(() => null);
+  await discardBody(res);
+  return res ? res.status : 0;
+}
+
+function randomShortId() {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 4);
+}
+
+// 网盘里文件改名 / 移动后，把 WebDAV 节点上的文件跟着改名。
+// moves: [{ entry, to }]；folderMove: { from, to }（移动整个文件夹时先整体 MOVE 一次）
+async function syncWebdavNamesAfterMove(env, R2, moves, folderMove = null) {
+  const davNodes = new Map((await getStorageNodes(env, true)).filter(n => n.type === 'webdav').map(n => [n.id, n]));
+  if (!davNodes.size) return;
+
+  // 读出涉及的分片文件清单（复制出来的文件共用一份清单，只处理一次）
+  const items = [];
+  const seen = new Set();
+  for (const { entry, to } of moves) {
+    if (!entry?.storageKey || seen.has(entry.storageKey)) continue;
+    seen.add(entry.storageKey);
+    if (entry.storageType && entry.storageType !== 'distributed') continue;
+    const obj = await R2.get(entry.storageKey).catch(() => null);
+    if (!obj) continue;
+    if (!hasManifestMetadata(obj)) { await discardBody(obj); continue; }
+    const manifest = await readManifestObject(obj);
+    if (!isManifestFile(manifest)) continue;
+    if (!manifest.parts.some(p => p.nodeType === 'webdav' && davNodes.has(p.nodeId))) continue;
+    items.push({ entry, to, manifest, obj, changed: false });
+  }
+  if (!items.length) return;
+
+  // 整个文件夹移动：每个 WebDAV 节点一次 MOVE
+  if (folderMove) {
+    const oldDir = webdavMirrorPath(folderMove.from);
+    const newDir = webdavMirrorPath(folderMove.to);
+    if (oldDir && newDir && oldDir !== newDir) {
+      for (const [nodeId, node] of davNodes) {
+        const affected = items.some(it => it.manifest.parts.some(p =>
+          p.nodeId === nodeId && p.davRoot && p.davRoot.startsWith(oldDir + '/')));
+        if (!affected) continue;
+        try {
+          await ensureWebdavDir(node);
+          await ensureWebdavParents(node, newDir);
+          const status = await webdavMove(node, oldDir, newDir, true);
+          if (status >= 200 && status < 300) {
+            for (const it of items) {
+              for (const p of it.manifest.parts) {
+                if (p.nodeId !== nodeId || !p.davRoot || !p.davRoot.startsWith(oldDir + '/')) continue;
+                p.key = newDir + p.key.slice(oldDir.length);
+                p.davRoot = newDir + p.davRoot.slice(oldDir.length);
+                it.changed = true;
+              }
+            }
+            await cleanupWebdavEmptyParents(node, oldDir).catch(() => {});
+          }
+        } catch (err) {
+          console.error('webdav folder move failed:', nodeId, err?.message || err);
+        }
+      }
+    }
+  }
+
+  // 逐个文件核对名字
+  for (const it of items) {
+    const total = it.manifest.parts.length;
+    const byNode = new Map();
+    for (const p of it.manifest.parts) {
+      if (p.nodeType !== 'webdav' || !davNodes.has(p.nodeId)) continue;
+      if (!byNode.has(p.nodeId)) byNode.set(p.nodeId, []);
+      byNode.get(p.nodeId).push(p);
+    }
+    for (const [nodeId, parts] of byNode) {
+      const node = davNodes.get(nodeId);
+      try {
+        const isDir = total > 1;
+        const root = parts[0].davRoot;
+        if (root && parts.every(p => p.davRoot === root)) {
+          // 优先用不带后缀的名字；那里已有东西时，原本就是「同名 + 后缀」的保持不动，否则换个新后缀
+          let suffix = '';
+          let desired = webdavMirrorPath(it.to);
+          if (desired === root) continue;
+          await ensureWebdavParents(node, desired);
+          let status = await webdavMove(node, root, desired, isDir);
+          if (status === 412) {
+            if (parts[0].davSuffix && webdavMirrorPath(it.to, parts[0].davSuffix) === root) continue;
+            suffix = randomShortId();
+            desired = webdavMirrorPath(it.to, suffix);
+            status = await webdavMove(node, root, desired, isDir);
+          }
+          if (status < 200 || status >= 300) continue;
+          for (const p of parts) {
+            p.key = desired + p.key.slice(root.length);
+            p.davRoot = desired;
+            p.davSuffix = suffix;
+          }
+          it.changed = true;
+          await cleanupWebdavEmptyParents(node, root).catch(() => {});
+        } else if (!root && parts.length <= 20) {
+          // 旧版本上传的（随机名字）：分片不多就顺手改成按路径存放
+          let suffix = '';
+          let desired = webdavMirrorPath(it.to);
+          if (await webdavPathExists(node, desired)) {
+            suffix = randomShortId();
+            desired = webdavMirrorPath(it.to, suffix);
+          }
+          await ensureWebdavParents(node, webdavPartKey(desired, 1, total));
+          for (const p of parts) {
+            const newKey = webdavPartKey(desired, p.partNumber, total);
+            const status = await webdavMove(node, p.key, newKey, false);
+            if (status < 200 || status >= 300) break;
+            p.key = newKey;
+            p.davRoot = desired;
+            p.davSuffix = suffix;
+            it.changed = true;
+          }
+          // 只搬了一部分时，把已搬的标记去掉，避免下次按整体目录处理
+          if (!parts.every(p => p.davRoot === desired)) {
+            for (const p of parts) { delete p.davRoot; delete p.davSuffix; }
+          }
+        }
+      } catch (err) {
+        console.error('webdav rename failed:', nodeId, err?.message || err);
+      }
+    }
+  }
+
+  for (const it of items) {
+    if (!it.changed) continue;
+    await R2.put(it.entry.storageKey, JSON.stringify(it.manifest), {
+      httpMetadata: { contentType: MANIFEST_CONTENT_TYPE },
+      customMetadata: it.obj.customMetadata || { r2driveManifest: '1', r2driveSize: String(manifestSize(it.manifest)) }
+    });
+  }
 }
 
 async function discardBody(res) {
@@ -8481,6 +8699,9 @@ async function moveVirtualPath(env, R2, from, to) {
     if (overwritten && overwritten.storageKey !== source.file.storageKey) {
       await cleanupUnreferencedStorage(env, R2, overwritten);
     }
+    await syncWebdavNamesAfterMove(env, R2, [{ entry: source.file, to: target }]).catch(err => {
+      console.error('sync webdav names failed:', err?.message || err);
+    });
     return { type: 'file', moved: 1 };
   }
 
@@ -8517,6 +8738,13 @@ async function moveVirtualPath(env, R2, from, to) {
     await deleteDirectoryIndex(env, folder);
   }
   for (const entry of overwritten) await cleanupUnreferencedStorage(env, R2, entry);
+  await syncWebdavNamesAfterMove(
+    env, R2,
+    source.files.map(file => ({ entry: file, to: rebaseVirtualPath(file.path, source.path, target) })),
+    { from: source.path, to: target }
+  ).catch(err => {
+    console.error('sync webdav names failed:', err?.message || err);
+  });
 
   return { type: 'folder', moved: source.files.length };
 }
@@ -9590,9 +9818,37 @@ async function deleteManifestParts(manifest, env, preservedPartIds = new Set(), 
   )), 16, part => env.R2_BUCKET.delete(part.key).catch(err => {
     console.error('delete R2 manifest part failed:', part.key, err?.message || err);
   }));
-  await mapWithConcurrency(parts.filter(part => (
+  // WebDAV 按路径存放的分片：同一文件在同一节点上整体删一次（多分片是一个文件夹），再清掉空的上级目录
+  const nodeParts = parts.filter(part => (
     part.storageType !== 'r2' && part.nodeId !== MAIN_STORAGE_NODE_ID && partHasNodeCreds(part) && !preservedPartIds.has(manifestPartId(part))
-  )), 8, async part => {
+  ));
+  const davGroups = new Map();
+  const singleParts = [];
+  for (const part of nodeParts) {
+    if (part.nodeType === 'webdav' && part.davRoot) {
+      const id = part.nodeId + '\x1f' + part.davRoot;
+      if (!davGroups.has(id)) davGroups.set(id, []);
+      davGroups.get(id).push(part);
+    } else {
+      singleParts.push(part);
+    }
+  }
+  const totalPartCount = (manifest.parts || []).length;
+  const preservedAny = preservedPartIds.size > 0;
+  await mapWithConcurrency([...davGroups.values()], 4, async group => {
+    const first = group[0];
+    const cfg = partNodeConfig(first);
+    const isDir = totalPartCount > 1;
+    if (isDir && preservedAny) { singleParts.push(...group); return; }
+    const res = await fetch(webdavObjectUrl(cfg, first.davRoot) + (isDir ? '/' : ''), { method: 'DELETE', headers: webdavAuthHeaders(cfg) }).catch(() => null);
+    await discardBody(res);
+    if (!res || !(res.ok || res.status === 404)) {
+      console.error('delete webdav file failed:', first.nodeId, first.davRoot, res ? res.status : 'network');
+      return;
+    }
+    await cleanupWebdavEmptyParents(cfg, first.davRoot).catch(() => {});
+  });
+  await mapWithConcurrency(singleParts, 8, async part => {
     const res = await deleteNodePart(part);
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
@@ -11402,6 +11658,7 @@ export default {
         }
         try {
           await ensureWebdavDir(davNode);
+          await ensureWebdavParents(davNode, part.key);
         } catch (err) {
           return jsonResponse({ ok: false, error: err?.message || 'webdav mkdir failed', nodeId: part.nodeId }, 502);
         }
@@ -11510,9 +11767,26 @@ export default {
       }
       const parts = [];
 
+      // WebDAV 节点按网盘路径存放；该位置已有东西时文件名加短后缀，避免覆盖
+      const davRoots = new Map();
+      for (const node of allocatedNodes) {
+        if (node.id === MAIN_STORAGE_NODE_ID || node.storageType === 'r2' || node.type !== 'webdav' || davRoots.has(node.id)) continue;
+        let suffix = '';
+        try {
+          await ensureWebdavDir(node);
+          if (await webdavPathExists(node, webdavMirrorPath(cleanPath))) suffix = randomShortId();
+        } catch {
+          suffix = randomShortId();
+        }
+        davRoots.set(node.id, { root: webdavMirrorPath(cleanPath, suffix), suffix });
+      }
+
       for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
         const node = allocatedNodes[partNumber - 1];
-        const partKey = NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
+        const dav = davRoots.get(node.id);
+        const partKey = dav
+          ? webdavPartKey(dav.root, partNumber, totalParts)
+          : NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
         const partSize = partSizes[partNumber - 1];
         const isMain = node.id === MAIN_STORAGE_NODE_ID || node.storageType === 'r2';
         const isDav = !isMain && node.type === 'webdav';
@@ -11523,6 +11797,7 @@ export default {
           key: partKey,
           storageType: isMain ? 'r2' : 'node',
           nodeType: isMain ? '' : (isDav ? 'webdav' : 'worker'),
+          ...(dav ? { davRoot: dav.root, davSuffix: dav.suffix } : {}),
           nodeId: isMain ? MAIN_STORAGE_NODE_ID : node.id,
           nodeName: isMain ? '主控账号' : node.name,
           nodeUrl: isMain ? '' : node.url,
@@ -11596,7 +11871,8 @@ export default {
           nodeType: part.nodeType || '',
           nodeId: part.nodeId,
           nodeName: part.nodeName,
-          nodeUrl: part.nodeUrl
+          nodeUrl: part.nodeUrl,
+          ...(part.davRoot ? { davRoot: part.davRoot, davSuffix: part.davSuffix || '' } : {})
         }))
       };
       const object = await R2.put(session.storageKey, JSON.stringify(manifest), {
@@ -11615,6 +11891,11 @@ export default {
       }));
       await adjustStoredNodeUsages(env, manifestNodeUsageDeltas(session.parts, 1));
       await kvDelete(env, MULTIPART_SESSION_PREFIX + sessionId);
+      // 覆盖同名文件时新文件先带了后缀，旧文件删掉后改回原名
+      if (session.parts.some(part => part.davSuffix)) {
+        await syncWebdavNamesAfterMove(env, R2, [{ entry: { storageKey: session.storageKey, storageType: 'distributed' }, to: session.path }])
+          .catch(err => console.error('webdav rename after replace failed:', err?.message || err));
+      }
       return jsonResponse({ ok: true });
     }
 
