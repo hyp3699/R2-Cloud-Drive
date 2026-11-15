@@ -483,6 +483,12 @@ function renderHTML(content, title = 'R2 云盘') {
     transition: opacity .2s;
   }
   .modal-overlay.open { opacity: 1; pointer-events: all; }
+  .details-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .details-table td { padding: 8px 4px; border-bottom: 1px solid var(--outline); vertical-align: top; }
+  .details-table td:first-child { color: var(--on-surface-variant); white-space: nowrap; width: 76px; }
+  .details-table td:last-child { word-break: break-all; }
+  .details-loc { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+  .details-loc small { color: var(--on-surface-variant); white-space: nowrap; }
   .modal {
     background: var(--surface); border-radius: var(--radius-l);
     width: 100%; max-width: 480px;
@@ -1291,6 +1297,9 @@ ${content}
   </div>
   <div class="context-menu-item" onclick="ctxRename()">
     <span class="material-icons-round">drive_file_rename_outline</span><span>重命名</span>
+  </div>
+  <div class="context-menu-item" onclick="ctxDetails()">
+    <span class="material-icons-round">info_outline</span><span>详情</span>
   </div>
   <div class="context-menu-item" id="ctxCopyLinkItem" onclick="ctxCopyLink()">
     <span class="material-icons-round">link</span><span>复制链接</span>
@@ -2852,6 +2861,45 @@ function ctxDownload() {
   const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
   startDownload(path, getFileSizeByName(ctxTarget));
 }
+function closeDetails() {
+  document.getElementById('detailsModal')?.classList.remove('open');
+}
+async function ctxDetails() {
+  if (!ctxTarget) return;
+  const target = ctxTarget;
+  const full = currentPath ? currentPath + '/' + target : target;
+  const body = document.getElementById('detailsBody');
+  if (!body) return;
+  body.innerHTML = '<div style="padding:16px;text-align:center;color:var(--on-surface-variant)">加载中…</div>';
+  document.getElementById('detailsModal')?.classList.add('open');
+  try {
+    const res = await fetch('/api/file-info?path=' + encodeURIComponent(full));
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || !d.ok) throw new Error(d.error || '读取失败');
+    const rows = [];
+    const add = (k, v) => rows.push('<tr><td>' + k + '</td><td>' + v + '</td></tr>');
+    add('名称', escapeHtml(d.name || target));
+    add('位置', escapeHtml('/' + (d.parent || '')));
+    if (d.type === 'folder') {
+      add('类型', '文件夹');
+      if (d.createdAt) add('创建时间', escapeHtml(formatDate(d.createdAt)));
+    } else {
+      add('大小', escapeHtml(formatSize(d.size || 0)) + ' <small style="color:var(--on-surface-variant)">(' + Number(d.size || 0).toLocaleString() + ' 字节)</small>');
+      add('类型', escapeHtml(d.contentType || '未知'));
+      if (d.uploaded) add('上传时间', escapeHtml(formatDate(d.uploaded)));
+      if (d.updatedAt && d.updatedAt !== d.uploaded) add('修改时间', escapeHtml(formatDate(d.updatedAt)));
+      const locs = (d.locations || []).map(l =>
+        '<div class="details-loc"><span>' + escapeHtml(l.name) + (l.kind ? ' <small>' + escapeHtml(l.kind) + '</small>' : '') + '</span>' +
+        '<small>' + (d.distributed ? escapeHtml(l.parts + ' 片 · ' + formatSize(l.bytes)) : '') + '</small></div>'
+      ).join('');
+      add('存储位置', (d.distributed ? '<div style="margin-bottom:4px">分片存储，共 ' + d.partCount + ' 片</div>' : '') + (locs || '未知'));
+    }
+    body.innerHTML = '<table class="details-table">' + rows.join('') + '</table>';
+  } catch (err) {
+    body.innerHTML = '<div style="padding:16px;color:var(--error)">' + escapeHtml(err.message || '读取失败') + '</div>';
+  }
+}
+
 function ctxRename() {
   if (!ctxTarget) return;
   const newName = prompt('重命名为:', ctxTarget);
@@ -5980,6 +6028,20 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
     <div class="modal-footer">
       <button class="btn-outlined" onclick="closeOfflineModal()">关闭</button>
       <button class="btn-outlined" onclick="loadOfflineTasks()">刷新任务</button>
+    </div>
+  </div>
+</div>
+
+<!-- File Details Modal -->
+<div class="modal-overlay" id="detailsModal" onclick="if(event.target===this)closeDetails()">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="material-icons-round" style="color:var(--primary)">info_outline</span>
+      <span class="modal-title">详情</span>
+    </div>
+    <div class="modal-body"><div id="detailsBody"></div></div>
+    <div class="modal-footer">
+      <button class="btn-outlined" onclick="closeDetails()">关闭</button>
     </div>
   </div>
 </div>
@@ -11679,6 +11741,67 @@ export default {
     }
 
     // Rename (copy + delete)
+    // 文件 / 文件夹详情：大小、上传时间、存在哪个存储（分片文件按节点汇总）
+    if (path === '/api/file-info' && request.method === 'GET') {
+      try {
+        const target = normalizeVirtualPath(url.searchParams.get('path') || '');
+        if (!target) return jsonResponse({ ok: false, error: '缺少路径' }, 400);
+        const parent = virtualParentPath(target);
+        const entry = await getFileEntry(env, target);
+        if (!entry) {
+          const folder = await getFolderEntry(env, target);
+          if (!folder) return jsonResponse({ ok: false, error: '找不到这个文件' }, 404);
+          return jsonResponse({ ok: true, type: 'folder', name: folder.name, parent, createdAt: folder.createdAt || '' });
+        }
+        const info = {
+          ok: true,
+          type: 'file',
+          name: entry.name,
+          parent,
+          size: Number(entry.size || 0),
+          contentType: entry.contentType || getMimeType(target),
+          uploaded: entry.uploaded || entry.createdAt || '',
+          updatedAt: entry.updatedAt || '',
+          distributed: false,
+          partCount: 0,
+          locations: []
+        };
+        const R2 = env.R2_BUCKET;
+        const head = await R2.head(entry.storageKey);
+        const manifest = head && hasManifestMetadata(head) ? await readManifestObject(await R2.get(entry.storageKey)) : null;
+        const obj = head;
+        if (isManifestFile(manifest)) {
+          const parts = await resolveManifestParts(manifest, env);
+          const nodes = await getStorageNodes(env, true).catch(() => []);
+          const nodeMap = new Map(nodes.map(n => [n.id, n]));
+          const groups = new Map();
+          for (const part of parts) {
+            const id = part.nodeId || MAIN_STORAGE_NODE_ID;
+            const node = nodeMap.get(id);
+            const g = groups.get(id) || {
+              id,
+              name: id === MAIN_STORAGE_NODE_ID ? '主控 R2' : (node?.name || part.nodeName || id),
+              kind: id === MAIN_STORAGE_NODE_ID ? 'R2' : ((node?.type || part.nodeType) === 'webdav' ? 'WebDAV' : 'Worker 节点') + (node ? '' : ' · 已删除'),
+              parts: 0,
+              bytes: 0
+            };
+            g.parts++;
+            g.bytes += Math.max(0, Number(part.size) || 0);
+            groups.set(id, g);
+          }
+          info.distributed = true;
+          info.partCount = parts.length;
+          info.size = manifestSize(manifest) || info.size;
+          info.locations = [...groups.values()];
+        } else {
+          info.locations = [{ id: MAIN_STORAGE_NODE_ID, name: '主控 R2', kind: obj ? 'R2' : 'R2 · 对象不存在', parts: 1, bytes: info.size }];
+        }
+        return jsonResponse(info);
+      } catch (err) {
+        return jsonResponse({ ok: false, error: err?.message || 'file info failed' }, 500);
+      }
+    }
+
     if (path === '/api/rename' && request.method === 'POST') {
       const { from, to } = await request.json().catch(() => ({}));
       if (!from || !to) return new Response('Missing fields', { status: 400 });
