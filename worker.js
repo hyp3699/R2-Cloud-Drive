@@ -2626,6 +2626,7 @@ function deleteSelected() {
   }).then(async r => {
     if (!r.ok) { showSnackbar('删除失败'); return; }
     const data = await r.json().catch(() => ({}));
+    bumpNodesCache();
     if (!reportNodeCleanupErrors(data)) showSnackbar('已删除 ' + selectedFiles.size + ' 个文件');
     location.reload();
   });
@@ -3401,6 +3402,7 @@ function ctxDelete() {
     .then(async r => {
       if (!r.ok) { showSnackbar('删除失败'); return; }
       const data = await r.json().catch(() => ({}));
+      bumpNodesCache();
       if (reportNodeCleanupErrors(data)) return location.reload();
       showSnackbar('已删除'); location.reload();
     });
@@ -3622,10 +3624,17 @@ async function uploadFiles(files) {
     if (list) list.append(item);
 
     const path = currentPath ? currentPath + '/' + file.name : file.name;
-    return uploadSingleFile(file, path, fill, pctSpan);
+    uploadNodeDeltas.delete(path);
+    return uploadSingleFile(file, path, fill, pctSpan).then(result => {
+      if (!uploadNodeDeltas.has(path)) uploadNodeDeltas.set(path, [{ nodeId: 'main', bytes: file.size }]);
+      return result;
+    });
   });
 
   Promise.allSettled(tasks).then(results => {
+    bumpNodesCache([...uploadNodeDeltas.values()].flat());
+    uploadNodeDeltas.clear();
+    if (typeof updateStorageInfo === 'function') updateStorageInfo();
     const failed = results.filter(result => result.status === 'rejected');
     if (failed.length) {
       const message = failed[0].reason?.message || '上传失败';
@@ -3865,6 +3874,7 @@ async function uploadDistributed(file, path, fill, pctSpan, targetNodeId = '') {
       body: JSON.stringify({ sessionId })
     });
     if (!completeRes.ok) throw new Error(await fetchErrorMessage(completeRes, 'distributed complete failed'));
+    uploadNodeDeltas.set(path, (session.distribution || []).map(d => ({ nodeId: d.nodeId, bytes: d.bytes })));
     fill.style.width = '100%';
     fill.classList.add('done');
     pctSpan.textContent = formatTransferStats(file.size, file.size, 0, true);
@@ -3967,6 +3977,20 @@ function writeNodesCache(nodes) {
 function clearNodesCache() {
   try { localStorage.removeItem(NODES_CACHE_KEY); } catch {}
 }
+// 上传 / 删除后：先把本地缓存里的已用量按这次的变化改掉（马上能看到），再标记过期，下次打开节点列表会重新读真实容量
+function bumpNodesCache(deltas = []) {
+  const c = readNodesCache();
+  if (!c) return;
+  for (const d of deltas) {
+    const n = c.nodes.find(x => x.id === d.nodeId);
+    if (n && Number.isFinite(Number(n.used))) n.used = Math.max(0, Number(n.used) + Number(d.bytes || 0));
+  }
+  try { localStorage.setItem(NODES_CACHE_KEY, JSON.stringify({ at: 0, nodes: c.nodes })); } catch {}
+  if (document.getElementById('storageNodesModal')?.classList.contains('open')) {
+    loadStorageNodes(true);
+  }
+}
+const uploadNodeDeltas = new Map();
 
 async function loadStorageNodes(force = false) {
   const list = document.getElementById('storageNodeList');
