@@ -2623,7 +2623,20 @@ function deleteSelected() {
     method: 'POST',
     headers: jsonHeaders(),
     body: JSON.stringify({ paths })
-  }).then(r => r.ok ? (showSnackbar('已删除 ' + selectedFiles.size + ' 个文件'), location.reload()) : showSnackbar('删除失败'));
+  }).then(async r => {
+    if (!r.ok) { showSnackbar('删除失败'); return; }
+    const data = await r.json().catch(() => ({}));
+    if (!reportNodeCleanupErrors(data)) showSnackbar('已删除 ' + selectedFiles.size + ' 个文件');
+    location.reload();
+  });
+}
+// 网盘里删掉了，但节点上的文件没删掉时弹窗说明原因
+function reportNodeCleanupErrors(data) {
+  const errs = Array.isArray(data?.cleanupErrors) ? data.cleanupErrors : [];
+  if (!errs.length) return false;
+  const lines = errs.slice(0, 5).map(e => '· ' + (e.nodeName || '节点') + '：' + (e.key || e.path || '') + '（' + (e.status ? 'HTTP ' + e.status : (e.detail || '连不上')) + '）');
+  alert('网盘里已删除，但节点上有 ' + errs.length + ' 个文件没删掉：\\n' + lines.join('\\n') + (errs.length > 5 ? '\\n……' : '') + '\\n\\n可以在「存储节点」里打开该节点手动删除。');
+  return true;
 }
 
 // ── Orphan File Cleanup ──
@@ -3385,7 +3398,12 @@ function ctxDelete() {
   if (!confirm('确定删除 "' + ctxTarget + '"？')) return;
   const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
   fetch('/api/delete?path=' + encodeURIComponent(path), { method: 'DELETE', headers: CSRF_HEADER })
-    .then(r => r.ok ? (showSnackbar('已删除'), location.reload()) : showSnackbar('删除失败'));
+    .then(async r => {
+      if (!r.ok) { showSnackbar('删除失败'); return; }
+      const data = await r.json().catch(() => ({}));
+      if (reportNodeCleanupErrors(data)) return location.reload();
+      showSnackbar('已删除'); location.reload();
+    });
 }
 
 // ── Offline Download (personal use only) ──
@@ -8566,8 +8584,9 @@ async function cleanupStorageEntry(env, R2, entry) {
   if (!entry?.storageKey) return;
   const obj = await R2.get(entry.storageKey);
   const manifest = await readManifestObject(obj);
-  if (isManifestFile(manifest)) await deleteManifestParts(manifest, env);
+  const failures = isManifestFile(manifest) ? await deleteManifestParts(manifest, env) : [];
   await R2.delete(entry.storageKey);
+  return failures;
 }
 
 async function replaceFileEntry(env, R2, entry, knownFolders = null, replacedSink = null) {
@@ -8813,32 +8832,42 @@ async function collectVirtualPathPaths(env, folderPath) {
 // until all R2 object deletions complete. Falls back to fire-and-forget
 // if ctx is not available (but cleanup may be unreliable in that case).
 function scheduleStorageCleanup(env, R2, entries, ctx) {
-  if (!entries || !entries.length) return;
+  if (!entries || !entries.length) return Promise.resolve([]);
   // Clone the data we need so the caller can move on
   const tasks = entries.filter(e => e?.storageKey).map(e => ({ storageKey: e.storageKey, path: e.path }));
-  if (!tasks.length) return;
+  if (!tasks.length) return Promise.resolve([]);
   if (!ctx) {
     console.warn('[scheduleStorageCleanup] called without ctx — cleanup may be killed before completion');
   }
   const cleanupPromise = (async () => {
+    const failures = [];
     try {
       const storageKeys = [...new Set(tasks.map(t => t.storageKey))];
       const referenced = await findReferencedStorageKeysD1(env, storageKeys);
       const toClean = tasks.filter(t => !referenced.has(t.storageKey));
       for (const entry of toClean) {
         try {
-          await cleanupStorageEntry(env, R2, entry);
+          const fails = await cleanupStorageEntry(env, R2, entry);
+          if (fails?.length) failures.push(...fails.map(f => ({ ...f, path: entry.path })));
         } catch (e) {
           console.error('[scheduleStorageCleanup] cleanupStorageEntry failed for', entry?.storageKey, ':', e?.message || e);
+          failures.push({ path: entry.path, status: 0, detail: e?.message || 'cleanup failed' });
         }
       }
     } catch (e) {
       console.error('[scheduleStorageCleanup] batch cleanup failed:', e?.message || e);
+      failures.push({ status: 0, detail: e?.message || 'cleanup failed' });
     }
+    return failures;
   })();
   if (ctx) {
     ctx.waitUntil(cleanupPromise);
   }
+  return cleanupPromise;
+}
+
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(fallback), ms))]);
 }
 
 async function batchDeleteKvKeys(env, keys) {
@@ -8878,8 +8907,10 @@ async function deleteVirtualPath(env, R2, path, ctx) {
   if (fileEntry) {
     await requireFsKv(env).delete(fileEntryKey(clean));
     await removeFileFromDirectoryIndex(env, clean);
-    scheduleStorageCleanup(env, R2, [fileEntry], ctx);
-    return { deleted: 1 };
+    const cleanup = scheduleStorageCleanup(env, R2, [{ ...fileEntry, path: clean }], ctx);
+    // 存在节点上的文件等清理做完，把没删掉的节点文件告诉前端
+    const cleanupErrors = fileEntry.storageType === 'distributed' ? await withTimeout(cleanup, 20000, []) : [];
+    return { deleted: 1, cleanupErrors };
   }
 
   // Check if it's a folder
@@ -8923,9 +8954,10 @@ async function deleteVirtualPath(env, R2, path, ctx) {
   await batchDeleteKvKeys(env, allKeys);
 
   // 4. Storage cleanup: deferred via ctx.waitUntil()
-  scheduleStorageCleanup(env, R2, storageEntries, ctx);
+  const cleanup = scheduleStorageCleanup(env, R2, storageEntries, ctx);
+  const cleanupErrors = storageEntries.some(e => e.storageType === 'distributed') ? await withTimeout(cleanup, 20000, []) : [];
 
-  return { deleted: filePaths.length + sortedFolders.length };
+  return { deleted: filePaths.length + sortedFolders.length, cleanupErrors };
 }
 
 async function deleteMultipleVirtualPaths(env, R2, paths, ctx) {
@@ -8989,11 +9021,13 @@ async function deleteMultipleVirtualPaths(env, R2, paths, ctx) {
   await batchDeleteKvKeys(env, allKeys);
 
   // 4. Storage cleanup: deferred via ctx.waitUntil()
-  scheduleStorageCleanup(env, R2, allStorageEntries, ctx);
+  const cleanup = scheduleStorageCleanup(env, R2, allStorageEntries, ctx);
+  const cleanupErrors = allStorageEntries.some(e => e.storageType === 'distributed') ? await withTimeout(cleanup, 20000, []) : [];
 
   return {
     deleted: uniqueFiles.length + uniqueFolders.length,
-    cleanupFailed: 0
+    cleanupFailed: cleanupErrors.length,
+    cleanupErrors
   };
 }
 
@@ -9672,7 +9706,8 @@ async function resolveManifestParts(manifest, env) {
       nodeUrl: part.nodeUrl || node?.url,
       token: part.token || node?.token,
       webdavUser: nodeType === 'webdav' ? (node?.username || '') : '',
-      webdavPass: nodeType === 'webdav' ? (node?.password || '') : ''
+      webdavPass: nodeType === 'webdav' ? (node?.password || '') : '',
+      nodeMissing: !node
     };
   });
 }
@@ -9872,7 +9907,8 @@ async function streamManifestFile(manifest, env, R2, byteRange = null) {
 }
 
 async function deleteManifestParts(manifest, env, preservedPartIds = new Set(), options = {}) {
-  if (!isManifestFile(manifest)) return;
+  const failures = [];
+  if (!isManifestFile(manifest)) return failures;
   const parts = await resolveManifestParts(manifest, env);
   await mapWithConcurrency(parts.filter(part => (
     (part.storageType === 'r2' || part.nodeId === MAIN_STORAGE_NODE_ID) && !preservedPartIds.has(manifestPartId(part))
@@ -9881,7 +9917,7 @@ async function deleteManifestParts(manifest, env, preservedPartIds = new Set(), 
   }));
   // WebDAV 按路径存放的分片：同一文件在同一节点上整体删一次（多分片是一个文件夹），再清掉空的上级目录
   const nodeParts = parts.filter(part => (
-    part.storageType !== 'r2' && part.nodeId !== MAIN_STORAGE_NODE_ID && partHasNodeCreds(part) && !preservedPartIds.has(manifestPartId(part))
+    part.storageType !== 'r2' && part.nodeId !== MAIN_STORAGE_NODE_ID && !part.nodeMissing && partHasNodeCreds(part) && !preservedPartIds.has(manifestPartId(part))
   ));
   const davGroups = new Map();
   const singleParts = [];
@@ -9905,6 +9941,7 @@ async function deleteManifestParts(manifest, env, preservedPartIds = new Set(), 
     await discardBody(res);
     if (!res || !(res.ok || res.status === 404)) {
       console.error('delete webdav file failed:', first.nodeId, first.davRoot, res ? res.status : 'network');
+      failures.push({ nodeName: first.nodeName || first.nodeId, key: first.davRoot, status: res ? res.status : 0 });
       return;
     }
     await cleanupWebdavEmptyParents(cfg, first.davRoot).catch(() => {});
@@ -9914,11 +9951,20 @@ async function deleteManifestParts(manifest, env, preservedPartIds = new Set(), 
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       console.error('delete node manifest part failed:', part.nodeId, part.key, res.status, detail.slice(0, 120));
+      failures.push({ nodeName: part.nodeName || part.nodeId, key: part.key, status: res.status || 0, detail: detail.slice(0, 120) });
     }
   });
+  // 分片缺节点信息（节点已删、凭据缺失）时也算没删掉
+  for (const part of parts) {
+    if (part.storageType === 'r2' || part.nodeId === MAIN_STORAGE_NODE_ID || preservedPartIds.has(manifestPartId(part))) continue;
+    if (part.nodeMissing || !partHasNodeCreds(part)) {
+      failures.push({ nodeName: part.nodeName || part.nodeId, key: part.key, status: 0, detail: '节点不存在或缺少账号' });
+    }
+  }
   if (options.adjustUsage !== false) {
     await adjustStoredNodeUsages(env, manifestNodeUsageDeltas(parts, -1, preservedPartIds));
   }
+  return failures;
 }
 
 async function handleStorageNodeApi(request, env) {
@@ -12048,8 +12094,8 @@ export default {
       if (cleanDeletePath === NOTES_FOLDER_NAME || (isNotesPath(cleanDeletePath) && !cleanDeletePath.toLowerCase().endsWith('.txt'))) {
         return jsonResponse({ ok: false, error: 'notes are private' }, 400);
       }
-      await deleteVirtualPath(env, R2, filePath, ctx);
-      return Response.json({ ok: true });
+      const result = await deleteVirtualPath(env, R2, filePath, ctx);
+      return Response.json({ ok: true, cleanupErrors: result?.cleanupErrors || [] });
     }
 
     // Batch delete
