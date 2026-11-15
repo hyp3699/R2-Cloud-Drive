@@ -9459,7 +9459,40 @@ async function manifestResponse(request, manifest, env, options = {}) {
     range,
     inline: options.inline
   });
-  const body = request.method === 'HEAD' ? null : await streamManifestFile(manifest, env, options.R2, range);
+  let body = null;
+  if (request.method !== 'HEAD') {
+    // 先读到第一块数据再回 200：分片在节点上已经不在（节点删了 / 文件被删）时直接报错，
+    // 不再回一个 200 然后中途断掉，让浏览器以为下载成功
+    const stream = await streamManifestFile(manifest, env, options.R2, range);
+    const reader = stream.getReader();
+    let first;
+    try {
+      first = await reader.read();
+    } catch (err) {
+      reader.cancel().catch(() => {});
+      console.error('manifest first chunk failed:', err?.message || err);
+      const errHeaders = new Headers(options.baseHeaders);
+      errHeaders.set('Content-Type', 'text/plain;charset=UTF-8');
+      errHeaders.set('Cache-Control', 'no-store');
+      return new Response('文件数据读取失败：存储节点上找不到这个文件（节点可能已删除、离线，或文件在节点上被删了）', { status: 502, headers: errHeaders });
+    }
+    let pendingFirst = first;
+    body = new ReadableStream({
+      async pull(controller) {
+        if (pendingFirst) {
+          const chunk = pendingFirst;
+          pendingFirst = null;
+          if (chunk.done) { controller.close(); return; }
+          controller.enqueue(chunk.value);
+          return;
+        }
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+      cancel(reason) { return reader.cancel(reason); }
+    });
+  }
   return new Response(body, {
     status: range ? 206 : 200,
     headers
