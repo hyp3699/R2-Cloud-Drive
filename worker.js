@@ -913,6 +913,45 @@ function renderHTML(content, title = 'R2 云盘') {
     .download-progress { min-width: 100%; margin-left: 0; }
   }
 
+  #storageNodesModal .modal { max-width: 560px; max-height: calc(100dvh - 48px); display: flex; flex-direction: column; }
+  #storageNodesModal .modal-body { overflow-y: auto; min-height: 0; -webkit-overflow-scrolling: touch; }
+  .node-modal-header .modal-title { flex: 1; }
+  .node-add-btn { height: 36px; padding: 0 14px; }
+  .node-add-btn.active { background: var(--primary-light); border-color: var(--primary); }
+  .node-summary { font-size: 12px; color: var(--on-surface-variant); margin-bottom: 10px; }
+  .node-form-panel {
+    display: none; padding: 14px; margin-bottom: 14px;
+    border: 1px solid var(--primary); border-radius: var(--radius-m); background: var(--primary-light);
+  }
+  .node-form-panel.open { display: block; }
+  .node-type-switch { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .node-form-hint { font-size: 12px; color: var(--on-surface-variant); line-height: 1.5; margin-top: 10px; }
+  .node-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .node-form-actions .btn-outlined, .node-form-actions .fab { height: 36px; padding: 0 16px; }
+  .node-card {
+    padding: 12px 12px 10px; border: 1px solid var(--outline);
+    border-radius: var(--radius-m); background: var(--surface);
+  }
+  .node-card.disabled { opacity: .6; }
+  .node-card-head { display: flex; align-items: center; gap: 10px; }
+  .node-card-icon {
+    width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--primary-light); color: var(--primary);
+  }
+  .node-card-icon .material-icons-round { font-size: 20px; }
+  .node-card-actions { display: flex; gap: 0; flex-shrink: 0; }
+  .node-card-actions .icon-btn { width: 34px; height: 34px; }
+  .node-badge {
+    display: inline-block; font-size: 11px; line-height: 18px; padding: 0 6px; margin-left: 6px;
+    border-radius: 9px; background: rgba(60,64,67,.08); color: var(--on-surface-variant); vertical-align: 1px; font-weight: 400;
+  }
+  .node-badge.webdav { background: #FEF7E0; color: #B06000; }
+  .node-badge.offline { background: #FCE8E6; color: var(--error); }
+  .node-cap { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--on-surface-variant); margin-top: 6px; }
+  .node-cap b { color: var(--on-surface); font-weight: 500; }
+  .node-row-fill.warn { background: var(--warning); }
+  .node-row-fill.full { background: var(--error); }
   .node-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
   .node-row {
     display: flex; align-items: center; gap: 12px;
@@ -3732,134 +3771,225 @@ function uploadDistributedPart(partInfo, chunk, onProgress) {
 function openStorageNodes() {
   document.getElementById('storageNodesModal')?.classList.add('open');
   backToNodeList();
+  toggleNodeForm(false);
   loadStorageNodes();
 }
 function closeStorageNodes() {
   document.getElementById('storageNodesModal')?.classList.remove('open');
-  // Reset R2 file viewer state
   backToNodeList();
+  toggleNodeForm(false);
 }
+
+let nodeFormType = 'worker';
+function toggleNodeForm(force) {
+  const panel = document.getElementById('nodeFormPanel');
+  const btn = document.getElementById('nodeAddBtn');
+  if (!panel) return;
+  const open = typeof force === 'boolean' ? force : !panel.classList.contains('open');
+  if (open) backToNodeList();
+  panel.classList.toggle('open', open);
+  btn?.classList.toggle('active', open);
+  if (open) {
+    setNodeFormType(nodeFormType);
+    setTimeout(() => document.getElementById('nodeNameInput')?.focus(), 50);
+  }
+}
+function setNodeFormType(type) {
+  nodeFormType = type === 'webdav' ? 'webdav' : 'worker';
+  const isDav = nodeFormType === 'webdav';
+  document.getElementById('nodeTypeWorker')?.classList.toggle('active', !isDav);
+  document.getElementById('nodeTypeWebdav')?.classList.toggle('active', isDav);
+  document.querySelectorAll('.node-field-worker').forEach(el => { el.style.display = isDav ? 'none' : ''; });
+  document.querySelectorAll('.node-field-webdav').forEach(el => { el.style.display = isDav ? '' : 'none'; });
+  const label = document.getElementById('nodeUrlLabel');
+  const url = document.getElementById('nodeUrlInput');
+  const hint = document.getElementById('nodeFormHint');
+  if (label) label.textContent = isDav ? 'WebDAV 地址（含存放目录）' : '节点 Worker 地址';
+  if (url) url.placeholder = isDav ? 'https://dav.jianguoyun.com/dav/R2网盘' : 'https://node.example.workers.dev';
+  if (hint) hint.textContent = isDav
+    ? '坚果云、Nextcloud、Alist 等支持 WebDAV 的网盘都可以。目录不存在会自动创建；坚果云要用「第三方应用管理」里生成的应用密码。大文件分片会经主控 Worker 中转存过去。'
+    : '填另一个账号部署的本网盘 Worker 地址，以及它的 STORAGE_NODE_TOKEN。';
+}
+
+function nodeUsagePct(node) {
+  const total = Number(node.total || 0);
+  if (!total) return 0;
+  return Math.min(100, Math.round(Number(node.used || 0) / total * 1000) / 10);
+}
+
 async function loadStorageNodes() {
   const list = document.getElementById('storageNodeList');
+  const summary = document.getElementById('nodeSummary');
   if (!list) return;
-  list.innerHTML = '<div class="node-row"><div class="node-row-main"><div class="node-row-sub">加载中...</div></div></div>';
+  if (summary) summary.textContent = '';
+  list.innerHTML = '<div class="node-card"><div class="node-row-sub">正在读取各节点容量...</div></div>';
   try {
-    const res = await fetch('/api/storage-nodes');
-    // 尝试解析 JSON，如果响应不是 JSON（如 Worker 崩溃返回的 HTML），则优雅降级
+    const res = await fetch('/api/storage-nodes?usage=1');
     let data;
     try {
       data = await res.json();
     } catch {
-      // 响应不是有效 JSON，可能服务器出错
-      if (list) list.innerHTML = '<div class="node-row"><div class="node-row-main"><div class="node-row-sub">服务器响应异常，请刷新页面重试</div></div></div>';
+      list.innerHTML = '<div class="node-card"><div class="node-row-sub">服务器响应异常，请刷新页面重试</div></div>';
       return;
     }
-    if (!res.ok) {
-      throw new Error(data?.error || 'HTTP ' + res.status);
+    if (!res.ok) throw new Error(data?.error || 'HTTP ' + res.status);
+    let nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+    if (!nodes.some(n => n.id === 'main')) {
+      nodes = [{ id: 'main', name: '主控账号', type: 'r2', enabled: true, online: true }, ...nodes];
     }
-    const externalNodes = Array.isArray(data?.nodes) ? data.nodes : [];
-    // Always include main account as the first node
-    const allNodes = [
-      { id: 'main', name: '主控账号', url: '本地 R2 存储桶', enabled: true },
-      ...externalNodes
-    ];
-    renderStorageNodes(allNodes);
+    renderStorageNodes(nodes);
   } catch (err) {
     console.warn('loadStorageNodes failed:', err?.message || err);
-    if (list) list.innerHTML = '<div class="node-row"><div class="node-row-main"><div class="node-row-sub">加载失败：' + escapeHtml((err?.message || '网络错误').slice(0, 40)) + '</div></div></div>';
+    list.innerHTML = '<div class="node-card"><div class="node-row-sub">加载失败：' + escapeHtml((err?.message || '网络错误').slice(0, 40)) + '</div></div>';
   }
 }
+
 function renderStorageNodes(nodes) {
   const list = document.getElementById('storageNodeList');
+  const summary = document.getElementById('nodeSummary');
   if (!list) return;
-  if (!nodes.length) {
-    list.innerHTML = '<div class="node-row"><div class="node-row-main"><div class="node-row-sub">暂无存储节点，大于 512KB 的文件将分布到外部节点</div></div></div>';
-    return;
+  const counted = nodes.filter(n => n.enabled !== false && typeof n.total === 'number');
+  if (summary && counted.length) {
+    const used = counted.reduce((s, n) => s + (n.used || 0), 0);
+    const total = counted.reduce((s, n) => s + (n.total || 0), 0);
+    summary.textContent = '共 ' + nodes.length + ' 个节点 · 合计已用 ' + formatSize(used) + ' / ' + formatSize(total);
   }
   list.innerHTML = '';
   nodes.forEach(node => {
     const isMain = node.id === 'main';
-    const row = document.createElement('div');
-    row.className = 'node-row';
+    const isDav = node.type === 'webdav';
+    const card = document.createElement('div');
+    card.className = 'node-card' + (node.enabled === false ? ' disabled' : '');
+
+    const head = document.createElement('div');
+    head.className = 'node-card-head';
+    const icon = document.createElement('div');
+    icon.className = 'node-card-icon';
+    icon.innerHTML = '<span class="material-icons-round">' + (isMain ? 'storage' : (isDav ? 'dns' : 'cloud')) + '</span>';
+
     const main = document.createElement('div');
     main.className = 'node-row-main';
     const title = document.createElement('div');
     title.className = 'node-row-title';
     title.textContent = node.name || node.id || '';
+    const badge = document.createElement('span');
+    badge.className = 'node-badge' + (isDav ? ' webdav' : '');
+    badge.textContent = isMain ? 'R2 主控' : (isDav ? 'WebDAV' : 'Worker');
+    title.appendChild(badge);
+    if (!isMain && node.online === false) {
+      const off = document.createElement('span');
+      off.className = 'node-badge offline';
+      off.textContent = '离线';
+      title.appendChild(off);
+    }
+    if (node.enabled === false) {
+      const dis = document.createElement('span');
+      dis.className = 'node-badge';
+      dis.textContent = '已停用';
+      title.appendChild(dis);
+    }
     const sub = document.createElement('div');
     sub.className = 'node-row-sub';
-    sub.textContent = isMain ? '本地 R2 存储桶' : ((node.url || '') + ' \u00B7 ' + (node.enabled !== false ? '启用' : '停用'));
+    sub.textContent = isMain ? '本账号 R2 存储桶' : ((node.url || '') + (isDav && node.username ? ' · ' + node.username : ''));
     main.append(title, sub);
 
-    const viewBtn = document.createElement('button');
-    viewBtn.className = 'icon-btn';
-    viewBtn.title = '查看R2文件';
-    viewBtn.innerHTML = '<span class="material-icons-round">folder_open</span>';
-    viewBtn.addEventListener('click', function() {
-      viewNodeR2Files(node.id, node.name || node.id);
-    });
-
-    row.append(main, viewBtn);
-
-    // Only add test/delete for external nodes
+    const actions = document.createElement('div');
+    actions.className = 'node-card-actions';
+    const addAction = (iconName, tip, fn) => {
+      const b = document.createElement('button');
+      b.className = 'icon-btn';
+      b.title = tip;
+      b.innerHTML = '<span class="material-icons-round">' + iconName + '</span>';
+      b.addEventListener('click', fn);
+      actions.appendChild(b);
+    };
+    addAction('folder_open', '查看文件', () => viewNodeR2Files(node.id, node.name || node.id));
     if (!isMain) {
-      const testBtn = document.createElement('button');
-      testBtn.className = 'icon-btn';
-      testBtn.title = '测试';
-      testBtn.innerHTML = '<span class="material-icons-round">network_check</span>';
-      testBtn.addEventListener('click', function() {
-        testStorageNode(node.id);
-      });
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'icon-btn';
-      delBtn.title = '删除';
-      delBtn.innerHTML = '<span class="material-icons-round">delete_outline</span>';
-      delBtn.addEventListener('click', function() {
-        deleteStorageNode(node.id);
-      });
-
-      row.append(testBtn, delBtn);
+      addAction('network_check', '测试', () => testStorageNode(node.id));
+      addAction('delete_outline', '删除', () => deleteStorageNode(node.id));
     }
+    head.append(icon, main, actions);
+    card.appendChild(head);
 
-    list.appendChild(row);
+    if (typeof node.total === 'number' && node.total > 0) {
+      const pct = nodeUsagePct(node);
+      const bar = document.createElement('div');
+      bar.className = 'node-row-bar';
+      const fill = document.createElement('div');
+      fill.className = 'node-row-fill' + (pct >= 95 ? ' full' : (pct >= 80 ? ' warn' : ''));
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      const cap = document.createElement('div');
+      cap.className = 'node-cap';
+      const left = document.createElement('span');
+      left.innerHTML = '已用 <b>' + escapeHtml(formatSize(node.used || 0)) + '</b> / 总容量 <b>' + escapeHtml(formatSize(node.total)) + '</b>';
+      const right = document.createElement('span');
+      let note = pct + '%';
+      if (node.storageAvailable === false) note = '容量未知 · ' + note;
+      else if (node.source === 'manual') note = '手动设定 · ' + note;
+      right.textContent = note;
+      cap.append(left, right);
+      card.append(bar, cap);
+    }
+    list.appendChild(card);
   });
 }
 function escapeHtml(value = '') {
   return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 async function saveStorageNode() {
+  const isDav = nodeFormType === 'webdav';
   const name = document.getElementById('nodeNameInput')?.value?.trim();
   const url = document.getElementById('nodeUrlInput')?.value?.trim();
   const token = document.getElementById('nodeTokenInput')?.value?.trim();
-  if (!name || !url || !token) { showSnackbar('请填写节点名称、地址和密钥'); return; }
-  const res = await fetch('/api/storage-nodes', {
-    method: 'POST',
-    headers: jsonHeaders(),
-    body: JSON.stringify({ name, url, token })
-  });
-  if (!res.ok) { showSnackbar('保存节点失败'); return; }
-  document.getElementById('nodeNameInput').value = '';
-  document.getElementById('nodeUrlInput').value = '';
-  document.getElementById('nodeTokenInput').value = '';
-  showSnackbar('节点已保存');
-  loadStorageNodes();
+  const username = document.getElementById('nodeUserInput')?.value?.trim();
+  const password = document.getElementById('nodePassInput')?.value || '';
+  const capacityGb = Number(document.getElementById('nodeCapInput')?.value || 0);
+  if (!name || !url) { showSnackbar('请填写节点名称和地址'); return; }
+  if (!/^https?:\\/\\//i.test(url)) { showSnackbar('地址要以 http:// 或 https:// 开头'); return; }
+  if (!isDav && !token) { showSnackbar('请填写节点密钥'); return; }
+  if (isDav && (!username || !password)) { showSnackbar('请填写 WebDAV 账号和密码'); return; }
+  const btn = document.getElementById('nodeSaveBtn');
+  if (btn) btn.disabled = true;
+  showSnackbar(isDav ? '正在连接 WebDAV...' : '正在保存...');
+  try {
+    const payload = isDav
+      ? { type: 'webdav', name, url, username, password, capacityGb: capacityGb > 0 ? capacityGb : 0 }
+      : { type: 'worker', name, url, token };
+    const res = await fetch('/api/storage-nodes', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(payload) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showSnackbar('保存失败：' + (data.error || 'HTTP ' + res.status)); return; }
+    ['nodeNameInput', 'nodeUrlInput', 'nodeTokenInput', 'nodeUserInput', 'nodePassInput', 'nodeCapInput'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    toggleNodeForm(false);
+    showSnackbar('节点已添加');
+    loadStorageNodes();
+    if (typeof updateStorageInfo === 'function') updateStorageInfo();
+  } catch (err) {
+    showSnackbar('保存失败：' + (err?.message || '网络错误'));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 async function deleteStorageNode(id) {
-  if (!confirm('确定删除这个存储节点？')) return;
+  if (!confirm('确定删除这个存储节点？\\n已经存到这个节点上的文件分片会读不到。')) return;
   const res = await fetch('/api/storage-nodes?id=' + encodeURIComponent(id), { method: 'DELETE', headers: CSRF_HEADER });
   showSnackbar(res.ok ? '节点已删除' : '删除节点失败');
   loadStorageNodes();
 }
 async function testStorageNode(id) {
+  showSnackbar('正在测试...');
   const res = await fetch('/api/storage-nodes/test?id=' + encodeURIComponent(id), { method: 'POST', headers: CSRF_HEADER });
   const data = await res.json().catch(() => ({}));
   if (res.ok) {
-    showSnackbar('节点正常，容量 ' + formatSize(data.used || 0) + ' / ' + formatSize(data.total || STORAGE_TOTAL));
+    showSnackbar('节点正常，已用 ' + formatSize(data.used || 0) + ' / ' + formatSize(data.total || STORAGE_TOTAL));
+    loadStorageNodes();
   } else if (data.ping && data.storage === false) {
     showSnackbar('节点可连接，但容量接口不可用，请更新节点 Worker');
   } else {
-    showSnackbar('节点连接失败');
+    showSnackbar('节点连接失败' + (data.error && data.error !== 'ping failed' ? '：' + data.error : ''));
   }
 }
 
@@ -3879,14 +4009,15 @@ function viewNodeR2Files(nodeId, nodeName) {
 
   // Show R2 file view, hide node list and form
   const nodeList = document.getElementById('storageNodeList');
-  const nodeForm = document.querySelector('.node-form-grid');
+  const nodeSummary = document.getElementById('nodeSummary');
   const r2fileView = document.getElementById('r2fileView');
   const r2fileTitle = document.getElementById('r2fileTitle');
 
+  toggleNodeForm(false);
   if (nodeList) nodeList.style.display = 'none';
-  if (nodeForm) nodeForm.style.display = 'none';
+  if (nodeSummary) nodeSummary.style.display = 'none';
   if (r2fileView) r2fileView.classList.add('open');
-  if (r2fileTitle) r2fileTitle.textContent = 'R2 文件 — ' + escapeHtml(nodeName);
+  if (r2fileTitle) r2fileTitle.textContent = '节点文件 — ' + nodeName;
 
   document.getElementById('r2fileList').innerHTML = '<div style="padding:16px;color:var(--on-surface-variant);text-align:center">加载中...</div>';
   document.getElementById('r2fileStats').textContent = '';
@@ -3897,11 +4028,11 @@ function viewNodeR2Files(nodeId, nodeName) {
 
 function backToNodeList() {
   const nodeList = document.getElementById('storageNodeList');
-  const nodeForm = document.querySelector('.node-form-grid');
+  const nodeSummary = document.getElementById('nodeSummary');
   const r2fileView = document.getElementById('r2fileView');
 
   if (nodeList) nodeList.style.display = '';
-  if (nodeForm) nodeForm.style.display = '';
+  if (nodeSummary) nodeSummary.style.display = '';
   if (r2fileView) r2fileView.classList.remove('open');
 
   r2fileViewNodeId = '';
@@ -3965,7 +4096,7 @@ function renderNodeR2Files(objects) {
   if (!list) return;
 
   if (!objects.length) {
-    list.innerHTML = '<div style="padding:24px;color:var(--on-surface-variant);text-align:center">此节点暂无 R2 对象</div>';
+    list.innerHTML = '<div style="padding:24px;color:var(--on-surface-variant);text-align:center">此节点暂无文件</div>';
     return;
   }
 
@@ -5868,19 +5999,67 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
 <!-- Storage Nodes Modal -->
 <div class="modal-overlay" id="storageNodesModal" onclick="if(event.target===this)closeStorageNodes()">
   <div class="modal">
-    <div class="modal-header">
+    <div class="modal-header node-modal-header">
       <span class="material-icons-round" style="color:var(--primary)">hub</span>
       <span class="modal-title">存储节点</span>
+      <button class="btn-outlined node-add-btn" id="nodeAddBtn" onclick="toggleNodeForm()">
+        <span class="material-icons-round">add</span> 添加节点
+      </button>
     </div>
     <div class="modal-body">
+      <!-- 添加节点表单（点顶部按钮展开） -->
+      <div class="node-form-panel" id="nodeFormPanel">
+        <div class="node-type-switch">
+          <button type="button" class="chip active" id="nodeTypeWorker" onclick="setNodeFormType('worker')">
+            <span class="material-icons-round">cloud</span> Worker 节点
+          </button>
+          <button type="button" class="chip" id="nodeTypeWebdav" onclick="setNodeFormType('webdav')">
+            <span class="material-icons-round">dns</span> WebDAV 网盘
+          </button>
+        </div>
+        <div class="node-form-grid">
+          <div class="full">
+            <label class="field-label" for="nodeNameInput">节点名称</label>
+            <input class="text-field" id="nodeNameInput" type="text" placeholder="账号 A">
+          </div>
+          <div class="full">
+            <label class="field-label" for="nodeUrlInput" id="nodeUrlLabel">节点 Worker 地址</label>
+            <input class="text-field" id="nodeUrlInput" type="url" placeholder="https://node.example.workers.dev">
+          </div>
+          <div class="full node-field-worker">
+            <label class="field-label" for="nodeTokenInput">节点密钥</label>
+            <input class="text-field" id="nodeTokenInput" type="password" placeholder="STORAGE_NODE_TOKEN">
+          </div>
+          <div class="node-field-webdav" style="display:none">
+            <label class="field-label" for="nodeUserInput">账号</label>
+            <input class="text-field" id="nodeUserInput" type="text" autocomplete="off" placeholder="邮箱 / 用户名">
+          </div>
+          <div class="node-field-webdav" style="display:none">
+            <label class="field-label" for="nodePassInput">密码</label>
+            <input class="text-field" id="nodePassInput" type="password" autocomplete="new-password" placeholder="应用密码">
+          </div>
+          <div class="full node-field-webdav" style="display:none">
+            <label class="field-label" for="nodeCapInput">分给网盘的容量（GB，可不填）</label>
+            <input class="text-field" id="nodeCapInput" type="number" min="0" step="0.1" inputmode="decimal" placeholder="不填则读取网盘报告的容量，读不到按 10 GB">
+          </div>
+        </div>
+        <div class="node-form-hint" id="nodeFormHint">填另一个账号部署的本网盘 Worker 地址，以及它的 STORAGE_NODE_TOKEN。</div>
+        <div class="node-form-actions">
+          <button class="btn-outlined" onclick="toggleNodeForm(false)">取消</button>
+          <button class="fab" style="box-shadow:none" id="nodeSaveBtn" onclick="saveStorageNode()">
+            <span class="material-icons-round">check</span> 保存
+          </button>
+        </div>
+      </div>
+      <div class="node-summary" id="nodeSummary"></div>
       <div class="node-list" id="storageNodeList"></div>
-      <!-- R2 File Viewer (hidden by default) -->
+      <!-- 节点文件查看（默认隐藏） -->
       <div class="r2file-view" id="r2fileView">
         <div class="r2file-toolbar">
           <button class="icon-btn" title="返回节点列表" onclick="backToNodeList()">
             <span class="material-icons-round">arrow_back</span>
           </button>
-          <span class="node-row-title" id="r2fileTitle">R2 文件</span>
+          <span class="node-row-title" id="r2fileTitle">节点文件</span>
         </div>
         <div class="r2file-stats" id="r2fileStats"></div>
         <div class="r2file-list" id="r2fileList"></div>
@@ -5888,27 +6067,9 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
           <button id="r2fileLoadBtn" onclick="loadNodeR2Files()">加载更多...</button>
         </div>
       </div>
-      <!-- End R2 File Viewer -->
-      <div class="node-form-grid">
-        <div>
-          <label class="field-label" for="nodeNameInput">节点名称</label>
-          <input class="text-field" id="nodeNameInput" type="text" placeholder="账号 A">
-        </div>
-        <div class="full">
-          <label class="field-label" for="nodeUrlInput">节点 Worker 地址</label>
-          <input class="text-field" id="nodeUrlInput" type="url" placeholder="https://node.example.workers.dev">
-        </div>
-        <div class="full">
-          <label class="field-label" for="nodeTokenInput">节点密钥</label>
-          <input class="text-field" id="nodeTokenInput" type="password" placeholder="STORAGE_NODE_TOKEN">
-        </div>
-      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-outlined" onclick="closeStorageNodes()">关闭</button>
-      <button class="fab" style="box-shadow:none" onclick="saveStorageNode()">
-        <span class="material-icons-round">add</span> 添加节点
-      </button>
     </div>
   </div>
 </div>
@@ -6222,27 +6383,292 @@ function normalizeNodeUrl(url = '') {
   return String(url || '').trim().replace(/\/+$/, '');
 }
 
+// 节点类型：worker = 另一个账号部署的本 Worker（/api/node/* 接口）；webdav = 别的网盘的 WebDAV（坚果云、Nextcloud、Alist 等）
 function sanitizeNode(node = {}) {
+  const type = node.type === 'webdav' ? 'webdav' : 'worker';
+  const capacity = Math.floor(Number(node.capacityBytes || 0));
   return {
     id: String(node.id || '').trim(),
     name: String(node.name || '').trim(),
+    type,
     url: normalizeNodeUrl(node.url),
-    token: String(node.token || '').trim(),
+    token: type === 'worker' ? String(node.token || '').trim() : '',
+    username: type === 'webdav' ? String(node.username || '').trim() : '',
+    password: type === 'webdav' ? String(node.password || '') : '',
+    capacityBytes: Number.isFinite(capacity) && capacity > 0 ? capacity : 0,
     enabled: node.enabled !== false,
     weight: Math.max(1, parseInt(node.weight || '1', 10) || 1),
     createdAt: String(node.createdAt || '').trim()
   };
 }
 
+function isValidNodeConfig(node) {
+  if (!node || !node.id || !node.url) return false;
+  if (!/^https?:\/\//i.test(node.url)) return false;
+  return node.type === 'webdav' ? true : !!node.token;
+}
+
 function publicNode(node) {
   return {
     id: node.id,
     name: node.name,
+    type: node.type === 'webdav' ? 'webdav' : 'worker',
     url: node.url,
+    username: node.type === 'webdav' ? (node.username || '') : '',
+    capacityBytes: node.capacityBytes || 0,
     enabled: node.enabled !== false,
     weight: node.weight || 1,
     createdAt: node.createdAt || ''
   };
+}
+
+// ── WebDAV 节点 ──
+// 分片存成 <WebDAV 地址>/<分片 key>，上传/下载都经主控 Worker 中转（浏览器直连 WebDAV 会被 CORS 拦）。
+const webdavDirReady = new Set();
+
+function webdavAuthHeaders(node, extra = {}) {
+  const headers = { ...extra };
+  if (node.username || node.password) {
+    const bytes = new TextEncoder().encode(String(node.username || '') + ':' + String(node.password || ''));
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    headers['Authorization'] = 'Basic ' + btoa(bin);
+  }
+  return headers;
+}
+
+function webdavObjectUrl(node, key) {
+  return normalizeNodeUrl(node.url) + '/' + encodeURIComponent(String(key || ''));
+}
+
+async function discardBody(res) {
+  try { await res?.body?.cancel(); } catch {}
+}
+
+const WEBDAV_QUOTA_PROPFIND = '<?xml version="1.0" encoding="utf-8"?>' +
+  '<d:propfind xmlns:d="DAV:"><d:prop><d:quota-used-bytes/><d:quota-available-bytes/><d:resourcetype/></d:prop></d:propfind>';
+const WEBDAV_LIST_PROPFIND = '<?xml version="1.0" encoding="utf-8"?>' +
+  '<d:propfind xmlns:d="DAV:"><d:prop><d:getcontentlength/><d:getlastmodified/><d:resourcetype/></d:prop></d:propfind>';
+
+function webdavPropfind(node, url, depth, body) {
+  return fetch(url, {
+    method: 'PROPFIND',
+    headers: webdavAuthHeaders(node, { 'Depth': String(depth), 'Content-Type': 'application/xml; charset=utf-8' }),
+    body
+  });
+}
+
+function xmlTagValue(xml, tag) {
+  const m = new RegExp('<(?:[A-Za-z0-9_-]+:)?' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</(?:[A-Za-z0-9_-]+:)?' + tag + '>', 'i').exec(xml);
+  return m ? m[1].trim() : '';
+}
+
+// 确保 WebDAV 目录存在：先 PROPFIND，不在就逐级 MKCOL（上级目录已存在 / 无权限的报错忽略，只看最后一级）
+async function ensureWebdavDir(node, force = false) {
+  const base = normalizeNodeUrl(node.url);
+  if (!force && webdavDirReady.has(base)) return;
+  const probe = await webdavPropfind(node, base + '/', 0, WEBDAV_QUOTA_PROPFIND).catch(() => null);
+  await discardBody(probe);
+  if (probe && (probe.status === 401 || probe.status === 403)) {
+    throw new Error('WebDAV 认证失败 (HTTP ' + probe.status + ')，请检查账号和应用密码');
+  }
+  if (probe && (probe.status === 207 || probe.status === 200)) { webdavDirReady.add(base); return; }
+  const u = new URL(base + '/');
+  const segs = u.pathname.split('/').filter(Boolean);
+  for (let i = 1; i <= segs.length; i++) {
+    const dir = u.origin + '/' + segs.slice(0, i).join('/') + '/';
+    const res = await fetch(dir, { method: 'MKCOL', headers: webdavAuthHeaders(node) }).catch(() => null);
+    await discardBody(res);
+    if (i === segs.length && !(res && (res.ok || res.status === 405))) {
+      throw new Error('WebDAV 创建目录失败 (HTTP ' + (res ? res.status : '网络错误') + ')');
+    }
+  }
+  webdavDirReady.add(base);
+}
+
+// 节点容量：返回 { used, total, online, storageAvailable, source }
+// WebDAV：填了总容量 → 上限按填的算，已用按本网盘写进去的分片累计；
+//         没填 → 用服务器报告的配额（quota-used / quota-available）；都没有 → 默认 10GB + 累计值
+async function getNodeUsageInfo(env, node) {
+  if (node.type === 'webdav') {
+    const estimated = await getStoredNodeUsage(env, node.id).catch(() => 0);
+    let online = false;
+    let qUsed = NaN;
+    let qAvail = NaN;
+    try {
+      const res = await webdavPropfind(node, normalizeNodeUrl(node.url) + '/', 0, WEBDAV_QUOTA_PROPFIND);
+      if (res.status === 207 || res.status === 200) {
+        online = true;
+        const xml = await res.text();
+        qUsed = Number(xmlTagValue(xml, 'quota-used-bytes'));
+        qAvail = Number(xmlTagValue(xml, 'quota-available-bytes'));
+      } else if (res.status === 404) {
+        // 目录还没建：服务器能连上，第一次上传时会自动创建
+        online = true;
+        await discardBody(res);
+      } else {
+        await discardBody(res);
+      }
+    } catch {}
+    const hasQuota = Number.isFinite(qUsed) && qUsed >= 0 && Number.isFinite(qAvail) && qAvail >= 0 && (qUsed + qAvail) > 0;
+    if (node.capacityBytes > 0) {
+      return { used: estimated, total: node.capacityBytes, online, storageAvailable: true, source: 'manual' };
+    }
+    if (hasQuota) {
+      return { used: qUsed, total: qUsed + qAvail, online, storageAvailable: true, source: 'quota' };
+    }
+    return { used: estimated, total: STORAGE_TOTAL_BYTES, online, storageAvailable: online, source: 'default' };
+  }
+
+  let online = false;
+  try {
+    const ping = await fetch(node.url + '/api/node/ping?key=ping', { headers: getNodeAuthHeaders(node) });
+    online = ping.ok;
+    await discardBody(ping);
+  } catch {}
+  if (online) {
+    try {
+      const res = await fetch(node.url + '/api/node/storage?key=storage', { headers: getNodeAuthHeaders(node) });
+      if (res.ok) {
+        const data = await res.json();
+        return {
+          used: Math.max(0, Number(data.used || 0)),
+          total: Math.max(1, Number(data.total || STORAGE_TOTAL_BYTES)),
+          online: true,
+          storageAvailable: true,
+          source: 'node'
+        };
+      }
+      await discardBody(res);
+    } catch {}
+  }
+  const estimated = await getStoredNodeUsage(env, node.id).catch(() => 0);
+  return { used: estimated, total: STORAGE_TOTAL_BYTES, online, storageAvailable: false, source: 'estimate' };
+}
+
+async function listWebdavNodeFiles(node) {
+  const base = normalizeNodeUrl(node.url);
+  const res = await webdavPropfind(node, base + '/', 1, WEBDAV_LIST_PROPFIND);
+  if (res.status === 404) { await discardBody(res); return []; }
+  if (res.status !== 207 && res.status !== 200) {
+    await discardBody(res);
+    throw new Error('WebDAV 列表失败 (HTTP ' + res.status + ')');
+  }
+  const xml = await res.text();
+  const basePath = decodeURIComponent(new URL(base + '/').pathname).replace(/\/+$/, '');
+  const objects = [];
+  const re = /<(?:[A-Za-z0-9_-]+:)?response(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?response>/gi;
+  let m;
+  while ((m = re.exec(xml))) {
+    const block = m[1];
+    if (/<(?:[A-Za-z0-9_-]+:)?collection\b/i.test(block)) continue;
+    let href = xmlTagValue(block, 'href');
+    if (!href) continue;
+    try { href = decodeURIComponent(new URL(href, base + '/').pathname); } catch {}
+    href = href.replace(/\/+$/, '');
+    if (href === basePath) continue;
+    const name = href.split('/').pop() || href;
+    const modified = xmlTagValue(block, 'getlastmodified');
+    objects.push({
+      key: name,
+      size: Math.max(0, Number(xmlTagValue(block, 'getcontentlength') || 0)),
+      uploaded: modified && !isNaN(Date.parse(modified)) ? new Date(modified).toISOString() : ''
+    });
+  }
+  return objects;
+}
+
+function partHasNodeCreds(part) {
+  if (!part || !part.nodeUrl || !part.key) return false;
+  return part.nodeType === 'webdav' ? true : !!part.token;
+}
+
+function partNodeConfig(part) {
+  return {
+    type: part.nodeType === 'webdav' ? 'webdav' : 'worker',
+    url: part.nodeUrl,
+    token: part.token || '',
+    username: part.webdavUser || '',
+    password: part.webdavPass || ''
+  };
+}
+
+// 把一个从 0 开始的完整响应体裁成 [start, start+length)：WebDAV 服务器不支持 Range 时兜底
+function sliceByteStream(body, start, length) {
+  const reader = body.getReader();
+  let skipped = 0;
+  let sent = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      while (true) {
+        if (sent >= length) { controller.close(); reader.cancel().catch(() => {}); return; }
+        const { done, value } = await reader.read();
+        if (done) { controller.close(); return; }
+        let chunk = value;
+        if (skipped < start) {
+          const need = start - skipped;
+          if (chunk.byteLength <= need) { skipped += chunk.byteLength; continue; }
+          chunk = chunk.subarray(need);
+          skipped = start;
+        }
+        const left = length - sent;
+        if (chunk.byteLength > left) chunk = chunk.subarray(0, left);
+        sent += chunk.byteLength;
+        controller.enqueue(chunk);
+        return;
+      }
+    },
+    cancel(reason) { return reader.cancel(reason); }
+  });
+}
+
+// 读节点分片的一段，返回 ReadableStream（不重试，调用方负责重试）
+async function openNodePartRange(part, range) {
+  if (!partHasNodeCreds(part)) throw new Error('missing node credentials');
+  const cfg = partNodeConfig(part);
+  if (cfg.type === 'webdav') {
+    const res = await fetch(webdavObjectUrl(cfg, part.key), {
+      headers: webdavAuthHeaders(cfg, { 'Range': `bytes=${range.start}-${range.end}` })
+    });
+    if (!res.ok || !res.body) { await discardBody(res); throw new Error(`failed to fetch webdav part: ${res.status}`); }
+    if (res.status === 206) {
+      const declaredLength = Number(res.headers.get('Content-Length') || 0);
+      if (declaredLength > 0 && declaredLength !== range.length) {
+        await discardBody(res);
+        throw new Error(`webdav part range length mismatch: ${declaredLength}/${range.length}`);
+      }
+      return res.body;
+    }
+    return sliceByteStream(res.body, range.start, range.length);
+  }
+  const res = await fetch(cfg.url.replace(/\/+$/, '') + '/api/node/part?key=' + encodeURIComponent(part.key), {
+    headers: {
+      'Authorization': 'Bearer ' + cfg.token,
+      'Range': `bytes=${range.start}-${range.end}`
+    }
+  });
+  if (!res.ok || !res.body) throw new Error(`failed to fetch node part: ${res.status}`);
+  if (res.status !== 206) { await discardBody(res); throw new Error('storage node does not support ranged downloads'); }
+  const declaredLength = Number(res.headers.get('Content-Length') || 0);
+  if (declaredLength > 0 && declaredLength !== range.length) {
+    await discardBody(res);
+    throw new Error(`node part range length mismatch: ${declaredLength}/${range.length}`);
+  }
+  return res.body;
+}
+
+async function deleteNodePart(part) {
+  const cfg = partNodeConfig(part);
+  if (cfg.type === 'webdav') {
+    const res = await fetch(webdavObjectUrl(cfg, part.key), { method: 'DELETE', headers: webdavAuthHeaders(cfg) })
+      .catch(err => ({ ok: false, status: 502, text: async () => err?.message || 'webdav delete failed' }));
+    if (res.status === 404) return { ok: true, status: 404, text: async () => '' };
+    return res;
+  }
+  return fetch(
+    cfg.url.replace(/\/+$/, '') + '/api/node/part?key=' + encodeURIComponent(part.key),
+    { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + cfg.token } }
+  ).catch(err => ({ ok: false, status: 502, text: async () => err?.message || 'node delete failed' }));
 }
 
 function mainStorageNode() {
@@ -6264,7 +6690,7 @@ async function getStorageNodes(env, includeDisabled = false) {
   try {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    const nodes = parsed.map(sanitizeNode).filter(node => node.id && node.url && node.token);
+    const nodes = parsed.map(sanitizeNode).filter(isValidNodeConfig);
     return includeDisabled ? nodes : nodes.filter(node => node.enabled !== false);
   } catch {
     return [];
@@ -8208,46 +8634,14 @@ async function getStorageNodeUsages(env, nodes) {
         };
       }
 
-      let nodeUsed = 0;
-      let nodeTotal = STORAGE_TOTAL_BYTES;
-      let reachable = false;
-      let liveUsage = false;
-      try {
-        // 先 ping 测试连通性和认证
-        const pingRes = await fetch(node.url + '/api/node/ping?key=ping', {
-          headers: getNodeAuthHeaders(node)
-        });
-        if (pingRes.ok) {
-          // ping 通过后再获取存储用量
-          try {
-            const storageRes = await fetch(node.url + '/api/node/storage?key=storage', {
-              headers: getNodeAuthHeaders(node)
-            });
-            if (storageRes.ok) {
-              const data = await storageRes.json();
-              nodeUsed = Math.max(0, Number(data.used || 0));
-              nodeTotal = Math.max(1, Number(data.total || STORAGE_TOTAL_BYTES));
-              liveUsage = true;
-            }
-          } catch {
-            // storage 接口失败但 ping 通过了，节点仍标记为可达
-          }
-          reachable = true;
-        }
-      } catch {
-        // 节点完全不可达
-      }
-
-      // 拿到节点实时用量就用实时值，拿不到才用 KV 里的估算值
-      const estimatedUsed = liveUsage ? 0 : await getStoredNodeUsage(env, node.id).catch(() => 0);
-      const used = liveUsage ? nodeUsed : estimatedUsed;
+      const info = await getNodeUsageInfo(env, node);
       return {
         node,
         index,
-        used,
-        total: nodeTotal,
+        used: info.used,
+        total: Math.max(1, info.total),
         assigned: 0,
-        reachable
+        reachable: info.online
       };
     } catch {
       const estimatedUsed = await getStoredNodeUsage(env, node.id).catch(() => 0);
@@ -8652,11 +9046,15 @@ async function resolveManifestParts(manifest, env) {
       };
     }
     const node = nodeMap.get(part.nodeId);
+    const nodeType = part.nodeType || node?.type || 'worker';
     return {
       ...part,
       storageType: 'node',
+      nodeType,
       nodeUrl: part.nodeUrl || node?.url,
-      token: part.token || node?.token
+      token: part.token || node?.token,
+      webdavUser: nodeType === 'webdav' ? (node?.username || '') : '',
+      webdavPass: nodeType === 'webdav' ? (node?.password || '') : ''
     };
   });
 }
@@ -8673,25 +9071,12 @@ async function fetchR2PartBytes(R2, part, range) {
 }
 
 async function fetchNodePartBytes(part, range) {
-  if (!part.nodeUrl || !part.token) throw new Error('missing node credentials');
+  if (!partHasNodeCreds(part)) throw new Error('missing node credentials');
   let lastError;
   for (let attempt = 0; attempt < DOWNLOAD_NODE_FETCH_RETRIES; attempt++) {
     try {
-      const res = await fetch(part.nodeUrl.replace(/\/+$/, '') + '/api/node/part?key=' + encodeURIComponent(part.key), {
-        headers: {
-          'Authorization': 'Bearer ' + part.token,
-          'Range': `bytes=${range.start}-${range.end}`
-        }
-      });
-      if (!res.ok || !res.body) throw new Error(`failed to fetch node part: ${res.status}`);
-      if (res.status !== 206) throw new Error('storage node does not support ranged downloads');
-
-      const declaredLength = Number(res.headers.get('Content-Length') || 0);
-      if (declaredLength > 0 && declaredLength !== range.length) {
-        throw new Error(`node part range length mismatch: ${declaredLength}/${range.length}`);
-      }
-
-      const bytes = new Uint8Array(await res.arrayBuffer());
+      const body = await openNodePartRange(part, range);
+      const bytes = new Uint8Array(await new Response(body).arrayBuffer());
       if (bytes.byteLength !== range.length) {
         throw new Error(`node part range ended at ${bytes.byteLength}/${range.length} bytes`);
       }
@@ -8751,23 +9136,12 @@ async function openR2SegmentStream(R2, part, range) {
 }
 
 async function openNodeSegmentStream(part, range) {
-  if (!part.nodeUrl || !part.token) throw new Error('missing node credentials');
+  if (!partHasNodeCreds(part)) throw new Error('missing node credentials');
   let lastError;
   for (let attempt = 0; attempt < DOWNLOAD_NODE_FETCH_RETRIES; attempt++) {
     try {
-      const res = await fetch(part.nodeUrl.replace(/\/+$/, '') + '/api/node/part?key=' + encodeURIComponent(part.key), {
-        headers: {
-          'Authorization': 'Bearer ' + part.token,
-          'Range': `bytes=${range.start}-${range.end}`
-        }
-      });
-      if (!res.ok || !res.body) throw new Error(`failed to fetch node part: ${res.status}`);
-      if (res.status !== 206) throw new Error('storage node does not support ranged downloads');
-      const declaredLength = Number(res.headers.get('Content-Length') || 0);
-      if (declaredLength > 0 && declaredLength !== range.length) {
-        throw new Error(`node part range length mismatch: ${declaredLength}/${range.length}`);
-      }
-      return res.body.getReader();
+      const body = await openNodePartRange(part, range);
+      return body.getReader();
     } catch (err) {
       lastError = err;
       if (attempt < DOWNLOAD_NODE_FETCH_RETRIES - 1) await delay(250 * (attempt + 1));
@@ -8888,12 +9262,9 @@ async function deleteManifestParts(manifest, env, preservedPartIds = new Set(), 
     console.error('delete R2 manifest part failed:', part.key, err?.message || err);
   }));
   await mapWithConcurrency(parts.filter(part => (
-    part.storageType !== 'r2' && part.nodeId !== MAIN_STORAGE_NODE_ID && part.nodeUrl && part.token && !preservedPartIds.has(manifestPartId(part))
+    part.storageType !== 'r2' && part.nodeId !== MAIN_STORAGE_NODE_ID && partHasNodeCreds(part) && !preservedPartIds.has(manifestPartId(part))
   )), 8, async part => {
-    const res = await fetch(
-      part.nodeUrl.replace(/\/+$/, '') + '/api/node/part?key=' + encodeURIComponent(part.key),
-      { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + part.token } }
-    ).catch(err => ({ ok: false, status: 502, text: async () => err?.message || 'node delete failed' }));
+    const res = await deleteNodePart(part);
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       console.error('delete node manifest part failed:', part.nodeId, part.key, res.status, detail.slice(0, 120));
@@ -10225,7 +10596,20 @@ export default {
       try {
         const nodes = await getStorageNodes(env, true);
         const safeNodes = Array.isArray(nodes) ? nodes : [];
-        return jsonResponse({ nodes: safeNodes.map(n => publicNode(n || {})) });
+        if (url.searchParams.get('usage') !== '1') {
+          return jsonResponse({ nodes: safeNodes.map(n => publicNode(n || {})) });
+        }
+        // 带容量：主控排第一，外部节点并发探测
+        const mainUsed = await getMainStorageUsed(env, true).catch(() => 0);
+        const main = {
+          id: MAIN_STORAGE_NODE_ID, name: '主控账号', type: 'r2', url: '', enabled: true,
+          used: mainUsed, total: storageTotalBytes(env), online: true, storageAvailable: true, source: 'r2'
+        };
+        const withUsage = await Promise.all(safeNodes.map(async n => {
+          const info = await getNodeUsageInfo(env, n).catch(() => ({ used: 0, total: STORAGE_TOTAL_BYTES, online: false, storageAvailable: false, source: 'error' }));
+          return { ...publicNode(n), ...info };
+        }));
+        return jsonResponse({ nodes: [main, ...withUsage] });
       } catch (err) {
         console.error('getStorageNodes failed:', err?.message || err);
         return jsonResponse({ nodes: [], error: 'storage nodes unavailable' });
@@ -10237,16 +10621,32 @@ export default {
         const body = await request.json().catch(() => ({}));
         const nodes = await getStorageNodes(env, true);
         const existing = body.id ? nodes.find(item => item.id === body.id) : null;
+        const type = body.type === 'webdav' ? 'webdav' : 'worker';
+        const capacityGb = Number(body.capacityGb || 0);
         const node = sanitizeNode({
           id: body.id || crypto.randomUUID(),
           name: body.name,
+          type,
           url: body.url,
-          token: body.token,
+          token: body.token || (existing?.type === 'worker' ? existing.token : ''),
+          username: body.username,
+          // 编辑时密码留空 = 保持原密码
+          password: body.password || (existing?.type === 'webdav' ? existing.password : ''),
+          capacityBytes: Number.isFinite(capacityGb) && capacityGb > 0 ? Math.floor(capacityGb * 1024 * 1024 * 1024) : 0,
           enabled: body.enabled !== false,
           weight: body.weight,
           createdAt: existing?.createdAt || new Date().toISOString()
         });
-        if (!node.name || !node.url || !node.token) return jsonResponse({ ok: false, error: 'missing fields' }, 400);
+        if (!node.name || !node.url) return jsonResponse({ ok: false, error: 'missing fields' }, 400);
+        if (!/^https?:\/\//i.test(node.url)) return jsonResponse({ ok: false, error: '地址要以 http:// 或 https:// 开头' }, 400);
+        if (type === 'worker' && !node.token) return jsonResponse({ ok: false, error: 'missing token' }, 400);
+        if (type === 'webdav') {
+          try {
+            await ensureWebdavDir(node, true);
+          } catch (err) {
+            return jsonResponse({ ok: false, error: err?.message || 'WebDAV 连接失败' }, 400);
+          }
+        }
         const index = nodes.findIndex(item => item.id === node.id);
         if (index >= 0) nodes[index] = node;
         else nodes.push(node);
@@ -10276,24 +10676,19 @@ export default {
       const nodes = await getStorageNodes(env, true);
       const node = nodes.find(item => item.id === id);
       if (!node) return jsonResponse({ ok: false, error: 'not found' }, 404);
-      const ping = await fetch(node.url + '/api/node/ping?key=ping', {
-        headers: getNodeAuthHeaders(node)
-      }).catch(() => null);
-      if (!ping?.ok) return jsonResponse({ ok: false, error: 'ping failed' }, 502);
-      const storage = await fetch(node.url + '/api/node/storage?key=storage', {
-        headers: getNodeAuthHeaders(node)
-      }).catch(() => null);
-      if (!storage?.ok) {
+      if (node.type === 'webdav') {
+        try {
+          await ensureWebdavDir(node, true);
+        } catch (err) {
+          return jsonResponse({ ok: false, ping: false, error: err?.message || 'webdav failed' }, 502);
+        }
+      }
+      const info = await getNodeUsageInfo(env, node);
+      if (!info.online) return jsonResponse({ ok: false, error: 'ping failed' }, 502);
+      if (!info.storageAvailable) {
         return jsonResponse({ ok: false, ping: true, storage: false, error: 'storage unavailable' }, 502);
       }
-      const storageData = await storage.json().catch(() => ({}));
-      return jsonResponse({
-        ok: true,
-        ping: true,
-        storage: true,
-        used: storageData.used || 0,
-        total: storageData.total || STORAGE_TOTAL_BYTES
-      });
+      return jsonResponse({ ok: true, ping: true, storage: true, used: info.used, total: info.total, source: info.source });
     }
 
     // R2 file viewer — list objects for main or external storage node
@@ -10322,6 +10717,11 @@ export default {
         const nodes = await getStorageNodes(env, true);
         const node = nodes.find(item => item.id === id);
         if (!node) return jsonResponse({ ok: false, error: 'node not found' }, 404);
+
+        if (node.type === 'webdav') {
+          const objects = await listWebdavNodeFiles(node);
+          return jsonResponse({ objects, cursor: null, truncated: false });
+        }
 
         const params = new URLSearchParams();
         params.set('limit', String(limit));
@@ -10363,33 +10763,16 @@ export default {
           }];
 
           const nodeUsages = await Promise.all(nodes.map(async node => {
-            try {
-              const res = await fetch(node.url + '/api/node/storage?key=storage', {
-                headers: getNodeAuthHeaders(node)
-              });
-              if (!res.ok) throw new Error('storage unavailable');
-              const data = await res.json();
-              return {
-                id: node.id,
-                name: node.name,
-                used: data.used || 0,
-                total: data.total || STORAGE_TOTAL_BYTES,
-                online: true,
-                storageAvailable: true
-              };
-            } catch {
-              const ping = await fetch(node.url + '/api/node/ping?key=ping', {
-                headers: getNodeAuthHeaders(node)
-              }).catch(() => null);
-              return {
-                id: node.id,
-                name: node.name,
-                used: 0,
-                total: STORAGE_TOTAL_BYTES,
-                online: !!ping?.ok,
-                storageAvailable: false
-              };
-            }
+            const info = await getNodeUsageInfo(env, node).catch(() => ({ used: 0, total: STORAGE_TOTAL_BYTES, online: false, storageAvailable: false }));
+            return {
+              id: node.id,
+              name: node.name,
+              type: node.type,
+              used: info.used || 0,
+              total: info.total || STORAGE_TOTAL_BYTES,
+              online: info.online,
+              storageAvailable: info.storageAvailable
+            };
           }));
 
           usageNodes.push(...nodeUsages);
@@ -10603,14 +10986,56 @@ export default {
       if (!part || part.storageType !== 'node' || part.uploadToken !== token) {
         return jsonResponse({ ok: false, error: 'invalid part token' }, 401);
       }
-      if (!part.nodeUrl || !part.token || !part.key) {
-        return jsonResponse({ ok: false, error: 'invalid node part config' }, 500);
-      }
 
       const expectedSize = Math.max(0, Number(part.size || 0));
       const contentLength = Number(request.headers.get('Content-Length') || 0);
       if (expectedSize > 0 && contentLength > 0 && contentLength !== expectedSize) {
         return jsonResponse({ ok: false, error: 'part size mismatch' }, 400);
+      }
+
+      if (part.nodeType === 'webdav') {
+        // WebDAV 节点：账号密码不放进上传会话，按节点 id 现查
+        const davNode = (await getStorageNodes(env, true)).find(item => item.id === part.nodeId);
+        if (!davNode || davNode.type !== 'webdav' || !part.key) {
+          return jsonResponse({ ok: false, error: 'webdav node not found' }, 500);
+        }
+        try {
+          await ensureWebdavDir(davNode);
+        } catch (err) {
+          return jsonResponse({ ok: false, error: err?.message || 'webdav mkdir failed', nodeId: part.nodeId }, 502);
+        }
+        // 用定长流转发，WebDAV 服务器拿到 Content-Length（不少服务器不接受 chunked 上传）
+        let davBody = request.body;
+        if (expectedSize > 0 && typeof FixedLengthStream !== 'undefined' && request.body) {
+          const fixed = new FixedLengthStream(expectedSize);
+          request.body.pipeTo(fixed.writable).catch(() => {});
+          davBody = fixed.readable;
+        }
+        const davRes = await fetch(webdavObjectUrl(davNode, part.key), {
+          method: 'PUT',
+          headers: webdavAuthHeaders(davNode, { 'Content-Type': 'application/octet-stream' }),
+          body: davBody
+        }).catch(err => ({ ok: false, status: 502, text: async () => err?.message || 'webdav fetch failed' }));
+        if (!davRes.ok) {
+          const text = await davRes.text().catch(() => '');
+          if (davRes.status === 409) webdavDirReady.delete(normalizeNodeUrl(davNode.url));
+          if (davRes.status === 507 || davRes.status === 413) {
+            return jsonResponse({ ok: false, code: 'STORAGE_FULL', error: '节点 ' + (part.nodeName || part.nodeId) + ' 存储空间不足' }, 507);
+          }
+          return jsonResponse({
+            ok: false,
+            error: 'webdav upload failed',
+            nodeId: part.nodeId,
+            status: davRes.status || 502,
+            detail: text.slice(0, 200)
+          }, 502);
+        }
+        await discardBody(davRes);
+        return jsonResponse({ ok: true, key: part.key, nodeId: part.nodeId });
+      }
+
+      if (!part.nodeUrl || !part.token || !part.key) {
+        return jsonResponse({ ok: false, error: 'invalid node part config' }, 500);
       }
 
       const nodeUrl = part.nodeUrl.replace(/\/+$/, '') + '/api/node/part?key='
@@ -10679,21 +11104,23 @@ export default {
         const partKey = NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
         const partSize = partSizes[partNumber - 1];
         const isMain = node.id === MAIN_STORAGE_NODE_ID || node.storageType === 'r2';
+        const isDav = !isMain && node.type === 'webdav';
         const uploadToken = crypto.randomUUID().replace(/-/g, '');
         parts.push({
           partNumber,
           size: partSize,
           key: partKey,
           storageType: isMain ? 'r2' : 'node',
+          nodeType: isMain ? '' : (isDav ? 'webdav' : 'worker'),
           nodeId: isMain ? MAIN_STORAGE_NODE_ID : node.id,
           nodeName: isMain ? '主控账号' : node.name,
           nodeUrl: isMain ? '' : node.url,
-          token: isMain ? '' : node.token,
+          token: isMain || isDav ? '' : node.token,
           uploadToken,
           uploadUrl: isMain
             ? '/api/distributed/main-part?sessionId=' + encodeURIComponent(sessionId) + '&partNumber=' + partNumber + '&token=' + encodeURIComponent(uploadToken)
             : '/api/distributed/node-part?sessionId=' + encodeURIComponent(sessionId) + '&partNumber=' + partNumber + '&token=' + encodeURIComponent(uploadToken),
-          directUploadUrl: isMain
+          directUploadUrl: isMain || isDav
             ? ''
             : node.url + '/api/node/part?key=' + encodeURIComponent(partKey) + '&size=' + partSize
         });
@@ -10755,6 +11182,7 @@ export default {
           size: part.size,
           key: part.key,
           storageType: part.storageType || 'node',
+          nodeType: part.nodeType || '',
           nodeId: part.nodeId,
           nodeName: part.nodeName,
           nodeUrl: part.nodeUrl
