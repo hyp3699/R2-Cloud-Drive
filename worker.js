@@ -3543,13 +3543,14 @@ function openUpload() {
   renderUploadTargetSelect();
 }
 
-// 上传目标：auto = 自动分配（大文件按剩余空间分到各节点）；main = 只存主控 R2；其他 = 只存到那个节点
-const UPLOAD_TARGET_KEY = 'uploadTarget_v1';
+// 上传目标：main = 只存主控 R2（默认）；auto = 自动分配（大文件按剩余空间分到各节点）；其他 = 只存到那个节点
+// v2：默认改为主控 R2，旧的 v1 选择（多为自动分配）不再沿用
+const UPLOAD_TARGET_KEY = 'uploadTarget_v2';
 function getUploadTarget() {
-  try { return localStorage.getItem(UPLOAD_TARGET_KEY) || 'auto'; } catch { return 'auto'; }
+  try { return localStorage.getItem(UPLOAD_TARGET_KEY) || 'main'; } catch { return 'main'; }
 }
 function setUploadTarget(v) {
-  try { localStorage.setItem(UPLOAD_TARGET_KEY, v || 'auto'); } catch {}
+  try { localStorage.setItem(UPLOAD_TARGET_KEY, v || 'main'); } catch {}
 }
 async function renderUploadTargetSelect() {
   const sel = document.getElementById('uploadTargetSelect');
@@ -3563,9 +3564,9 @@ async function renderUploadTargetSelect() {
     } catch {}
   }
   const current = getUploadTarget();
-  const opts = [['auto', '自动分配（按剩余空间）'], ['main', '主控 R2']];
+  const opts = [['main', '主控 R2'], ['auto', '自动分配（按剩余空间）']];
   nodes.filter(n => n.enabled !== false).forEach(n => {
-    opts.push([n.id, (n.name || n.id) + (n.type === 'webdav' ? '（WebDAV）' : '（Worker）')]);
+    opts.push([n.id, (n.name || n.id) + (n.type === 'webdav' ? '（WebDAV）' : '（R2 存储桶）')]);
   });
   sel.innerHTML = '';
   opts.forEach(pair => {
@@ -3574,7 +3575,7 @@ async function renderUploadTargetSelect() {
     o.textContent = pair[1];
     sel.appendChild(o);
   });
-  sel.value = opts.some(pair => pair[0] === current) ? current : 'auto';
+  sel.value = opts.some(pair => pair[0] === current) ? current : 'main';
   if (sel.value !== current) setUploadTarget(sel.value);
 }
 function closeUpload() { document.getElementById('uploadModal')?.classList.remove('open'); }
@@ -4187,7 +4188,7 @@ async function deleteStorageNode(id) {
   if (res.ok) {
     const c = readNodesCache();
     if (c) writeNodesCache(c.nodes.filter(n => n.id !== id));
-    if (getUploadTarget() === id) setUploadTarget('auto');
+    if (getUploadTarget() === id) setUploadTarget('main');
   }
   loadStorageNodes(true);
 }
