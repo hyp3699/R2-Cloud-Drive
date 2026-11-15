@@ -951,6 +951,15 @@ function renderHTML(content, title = 'R2 云盘') {
   .node-cap { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--on-surface-variant); margin-top: 6px; }
   .node-cap b { color: var(--on-surface); font-weight: 500; }
   .node-row-fill.warn { background: var(--warning); }
+  .upload-target-row { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+  .upload-target-row label { white-space: nowrap; }
+  .upload-target-row select { flex: 1; min-width: 0; height: 40px; padding: 0 10px; }
+  #nodeRefreshBtn.spinning .material-icons-round { animation: spin 1s linear infinite; }
+  .node-cache-note { font-size: 11px; color: var(--on-surface-variant); }
+  .r2file-row.dir { cursor: pointer; font-family: var(--font-body); }
+  .r2file-row.dir .material-icons-round { font-size: 18px; color: var(--warning); }
+  .r2file-row.up { cursor: pointer; font-family: var(--font-body); color: var(--primary); }
+  .r2file-row.up .material-icons-round { font-size: 18px; }
   .node-row-fill.full { background: var(--error); }
   .node-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
   .node-row {
@@ -3456,7 +3465,45 @@ function renderOfflineTasks() {
 }
 
 // ── Upload ──
-function openUpload() { document.getElementById('uploadModal')?.classList.add('open'); }
+function openUpload() {
+  document.getElementById('uploadModal')?.classList.add('open');
+  renderUploadTargetSelect();
+}
+
+// 上传目标：auto = 自动分配（大文件按剩余空间分到各节点）；main = 只存主控 R2；其他 = 只存到那个节点
+const UPLOAD_TARGET_KEY = 'uploadTarget_v1';
+function getUploadTarget() {
+  try { return localStorage.getItem(UPLOAD_TARGET_KEY) || 'auto'; } catch { return 'auto'; }
+}
+function setUploadTarget(v) {
+  try { localStorage.setItem(UPLOAD_TARGET_KEY, v || 'auto'); } catch {}
+}
+async function renderUploadTargetSelect() {
+  const sel = document.getElementById('uploadTargetSelect');
+  if (!sel) return;
+  let nodes = (readNodesCache()?.nodes || []).filter(n => n.id !== 'main');
+  if (!nodes.length) {
+    try {
+      const res = await fetch('/api/storage-nodes');
+      const data = await res.json();
+      nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+    } catch {}
+  }
+  const current = getUploadTarget();
+  const opts = [['auto', '自动分配（按剩余空间）'], ['main', '主控 R2']];
+  nodes.filter(n => n.enabled !== false).forEach(n => {
+    opts.push([n.id, (n.name || n.id) + (n.type === 'webdav' ? '（WebDAV）' : '（Worker）')]);
+  });
+  sel.innerHTML = '';
+  opts.forEach(pair => {
+    const o = document.createElement('option');
+    o.value = pair[0];
+    o.textContent = pair[1];
+    sel.appendChild(o);
+  });
+  sel.value = opts.some(pair => pair[0] === current) ? current : 'auto';
+  if (sel.value !== current) setUploadTarget(sel.value);
+}
 function closeUpload() { document.getElementById('uploadModal')?.classList.remove('open'); }
 function openNewFolder() { document.getElementById('newFolderModal')?.classList.add('open'); setTimeout(() => document.getElementById('folderNameInput')?.focus(), 100); }
 function closeNewFolder() { document.getElementById('newFolderModal')?.classList.remove('open'); }
@@ -3520,6 +3567,21 @@ async function uploadFiles(files) {
 }
 
 function uploadSingleFile(file, path, fill, pctSpan) {
+  const target = getUploadTarget();
+  if (target === 'main') {
+    // 只存主控 R2：小文件直传，大文件走 R2 分片上传
+    return file.size <= DIRECT_UPLOAD_LIMIT
+      ? uploadDirect(file, path, fill, pctSpan)
+      : uploadMultipart(file, path, fill, pctSpan);
+  }
+  if (target !== 'auto' && file.size > 0) {
+    // 指定节点：整份存到那个节点，失败不回退，直接报错
+    return uploadDistributed(file, path, fill, pctSpan, target).catch(err => {
+      fill.classList.add('error');
+      pctSpan.textContent = err?.code === 'STORAGE_FULL' ? '空间不足' : '✗';
+      throw err;
+    });
+  }
   if (file.size <= DIRECT_UPLOAD_LIMIT) {
     return uploadDirect(file, path, fill, pctSpan);
   }
@@ -3676,7 +3738,7 @@ function uploadMultipartPart(path, uploadId, partNumber, chunk, onProgress) {
   });
 }
 
-async function uploadDistributed(file, path, fill, pctSpan) {
+async function uploadDistributed(file, path, fill, pctSpan, targetNodeId = '') {
   const chunkSize = Math.min(MULTIPART_MAX_CHUNK, Math.max(MULTIPART_DEFAULT_CHUNK, Math.ceil(file.size / MULTIPART_MAX_PARTS)));
   const totalParts = Math.ceil(file.size / chunkSize);
   if (totalParts > MULTIPART_MAX_PARTS) throw new Error('too many distributed chunks');
@@ -3689,7 +3751,8 @@ async function uploadDistributed(file, path, fill, pctSpan) {
       size: file.size,
       contentType: file.type || '',
       chunkSize,
-      parts: totalParts
+      parts: totalParts,
+      targetNodeId: targetNodeId || ''
     })
   });
   if (!initRes.ok) {
@@ -3817,42 +3880,82 @@ function nodeUsagePct(node) {
   return Math.min(100, Math.round(Number(node.used || 0) / total * 1000) / 10);
 }
 
-async function loadStorageNodes() {
-  const list = document.getElementById('storageNodeList');
-  const summary = document.getElementById('nodeSummary');
-  if (!list) return;
-  if (summary) summary.textContent = '';
-  list.innerHTML = '<div class="node-card"><div class="node-row-sub">正在读取各节点容量...</div></div>';
+// 节点容量缓存在本机：打开弹窗先显示上次结果，超过 10 分钟才在后台静默刷新；点刷新按钮强制刷新
+const NODES_CACHE_KEY = 'storageNodesCache_v1';
+const NODES_CACHE_TTL_MS = 10 * 60 * 1000;
+let nodesLoading = null;
+function readNodesCache() {
   try {
-    const res = await fetch('/api/storage-nodes?usage=1');
-    let data;
-    try {
-      data = await res.json();
-    } catch {
-      list.innerHTML = '<div class="node-card"><div class="node-row-sub">服务器响应异常，请刷新页面重试</div></div>';
-      return;
-    }
-    if (!res.ok) throw new Error(data?.error || 'HTTP ' + res.status);
-    let nodes = Array.isArray(data?.nodes) ? data.nodes : [];
-    if (!nodes.some(n => n.id === 'main')) {
-      nodes = [{ id: 'main', name: '主控账号', type: 'r2', enabled: true, online: true }, ...nodes];
-    }
-    renderStorageNodes(nodes);
-  } catch (err) {
-    console.warn('loadStorageNodes failed:', err?.message || err);
-    list.innerHTML = '<div class="node-card"><div class="node-row-sub">加载失败：' + escapeHtml((err?.message || '网络错误').slice(0, 40)) + '</div></div>';
-  }
+    const c = JSON.parse(localStorage.getItem(NODES_CACHE_KEY) || 'null');
+    return c && Array.isArray(c.nodes) ? c : null;
+  } catch { return null; }
+}
+function writeNodesCache(nodes) {
+  try { localStorage.setItem(NODES_CACHE_KEY, JSON.stringify({ at: Date.now(), nodes })); } catch {}
+}
+function clearNodesCache() {
+  try { localStorage.removeItem(NODES_CACHE_KEY); } catch {}
 }
 
-function renderStorageNodes(nodes) {
+async function loadStorageNodes(force = false) {
+  const list = document.getElementById('storageNodeList');
+  if (!list) return;
+  const cache = readNodesCache();
+  if (cache && cache.nodes.length) {
+    renderStorageNodes(cache.nodes, cache.at);
+    if (!force && Date.now() - (cache.at || 0) < NODES_CACHE_TTL_MS) return;
+  } else {
+    list.innerHTML = '<div class="node-card"><div class="node-row-sub">正在读取各节点容量...</div></div>';
+  }
+  if (nodesLoading) return nodesLoading;
+  const btn = document.getElementById('nodeRefreshBtn');
+  if (btn) btn.classList.add('spinning');
+  nodesLoading = (async () => {
+    try {
+      const res = await fetch('/api/storage-nodes?usage=1');
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        if (!cache) list.innerHTML = '<div class="node-card"><div class="node-row-sub">服务器响应异常，请刷新页面重试</div></div>';
+        return;
+      }
+      if (!res.ok) throw new Error(data?.error || 'HTTP ' + res.status);
+      let nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+      if (!nodes.some(n => n.id === 'main')) {
+        nodes = [{ id: 'main', name: '主控账号', type: 'r2', enabled: true, online: true }, ...nodes];
+      }
+      writeNodesCache(nodes);
+      if (!document.getElementById('r2fileView')?.classList.contains('open')) renderStorageNodes(nodes, Date.now());
+    } catch (err) {
+      console.warn('loadStorageNodes failed:', err?.message || err);
+      if (!cache) list.innerHTML = '<div class="node-card"><div class="node-row-sub">加载失败：' + escapeHtml((err?.message || '网络错误').slice(0, 40)) + '</div></div>';
+      else showSnackbar('刷新容量失败，显示的是上次结果');
+    } finally {
+      if (btn) btn.classList.remove('spinning');
+      nodesLoading = null;
+    }
+  })();
+  return nodesLoading;
+}
+
+function renderStorageNodes(nodes, at) {
   const list = document.getElementById('storageNodeList');
   const summary = document.getElementById('nodeSummary');
   if (!list) return;
   const counted = nodes.filter(n => n.enabled !== false && typeof n.total === 'number');
-  if (summary && counted.length) {
-    const used = counted.reduce((s, n) => s + (n.used || 0), 0);
-    const total = counted.reduce((s, n) => s + (n.total || 0), 0);
-    summary.textContent = '共 ' + nodes.length + ' 个节点 · 合计已用 ' + formatSize(used) + ' / ' + formatSize(total);
+  if (summary) {
+    let text = '';
+    if (counted.length) {
+      const used = counted.reduce((s, n) => s + (n.used || 0), 0);
+      const total = counted.reduce((s, n) => s + (n.total || 0), 0);
+      text = '共 ' + nodes.length + ' 个节点 · 合计已用 ' + formatSize(used) + ' / ' + formatSize(total);
+    }
+    if (at) {
+      const mins = Math.floor((Date.now() - at) / 60000);
+      text += (text ? ' · ' : '') + (mins < 1 ? '刚刚更新' : mins + ' 分钟前更新');
+    }
+    summary.textContent = text;
   }
   list.innerHTML = '';
   nodes.forEach(node => {
@@ -3903,7 +4006,7 @@ function renderStorageNodes(nodes) {
       b.addEventListener('click', fn);
       actions.appendChild(b);
     };
-    addAction('folder_open', '查看文件', () => viewNodeR2Files(node.id, node.name || node.id));
+    addAction('folder_open', '查看文件', () => viewNodeR2Files(node.id, node.name || node.id, node.type));
     if (!isMain) {
       addAction('network_check', '测试', () => testStorageNode(node.id));
       addAction('delete_outline', '删除', () => deleteStorageNode(node.id));
@@ -3965,7 +4068,7 @@ async function saveStorageNode() {
     });
     toggleNodeForm(false);
     showSnackbar('节点已添加');
-    loadStorageNodes();
+    loadStorageNodes(true);
     if (typeof updateStorageInfo === 'function') updateStorageInfo();
   } catch (err) {
     showSnackbar('保存失败：' + (err?.message || '网络错误'));
@@ -3977,7 +4080,12 @@ async function deleteStorageNode(id) {
   if (!confirm('确定删除这个存储节点？\\n已经存到这个节点上的文件分片会读不到。')) return;
   const res = await fetch('/api/storage-nodes?id=' + encodeURIComponent(id), { method: 'DELETE', headers: CSRF_HEADER });
   showSnackbar(res.ok ? '节点已删除' : '删除节点失败');
-  loadStorageNodes();
+  if (res.ok) {
+    const c = readNodesCache();
+    if (c) writeNodesCache(c.nodes.filter(n => n.id !== id));
+    if (getUploadTarget() === id) setUploadTarget('auto');
+  }
+  loadStorageNodes(true);
 }
 async function testStorageNode(id) {
   showSnackbar('正在测试...');
@@ -3985,7 +4093,7 @@ async function testStorageNode(id) {
   const data = await res.json().catch(() => ({}));
   if (res.ok) {
     showSnackbar('节点正常，已用 ' + formatSize(data.used || 0) + ' / ' + formatSize(data.total || STORAGE_TOTAL));
-    loadStorageNodes();
+    loadStorageNodes(true);
   } else if (data.ping && data.storage === false) {
     showSnackbar('节点可连接，但容量接口不可用，请更新节点 Worker');
   } else {
@@ -3999,10 +4107,14 @@ let r2fileViewNodeName = '';
 let r2fileCursor = null;
 let r2fileTruncated = false;
 let r2fileAllObjects = [];
+let r2fileViewNodeType = '';
+let r2fileDir = '';
 
-function viewNodeR2Files(nodeId, nodeName) {
+function viewNodeR2Files(nodeId, nodeName, nodeType, dir) {
   r2fileViewNodeId = nodeId;
   r2fileViewNodeName = nodeName;
+  r2fileViewNodeType = nodeType || '';
+  r2fileDir = dir || '';
   r2fileCursor = null;
   r2fileTruncated = false;
   r2fileAllObjects = [];
@@ -4017,7 +4129,7 @@ function viewNodeR2Files(nodeId, nodeName) {
   if (nodeList) nodeList.style.display = 'none';
   if (nodeSummary) nodeSummary.style.display = 'none';
   if (r2fileView) r2fileView.classList.add('open');
-  if (r2fileTitle) r2fileTitle.textContent = '节点文件 — ' + nodeName;
+  if (r2fileTitle) r2fileTitle.textContent = nodeName + (r2fileDir ? ' / ' + r2fileDir : '');
 
   document.getElementById('r2fileList').innerHTML = '<div style="padding:16px;color:var(--on-surface-variant);text-align:center">加载中...</div>';
   document.getElementById('r2fileStats').textContent = '';
@@ -4037,6 +4149,8 @@ function backToNodeList() {
 
   r2fileViewNodeId = '';
   r2fileViewNodeName = '';
+  r2fileViewNodeType = '';
+  r2fileDir = '';
   r2fileCursor = null;
   r2fileAllObjects = [];
 }
@@ -4059,6 +4173,7 @@ async function loadNodeR2Files() {
     params.set('id', r2fileViewNodeId);
     params.set('limit', '100');
     if (r2fileCursor) params.set('cursor', r2fileCursor);
+    if (r2fileDir) params.set('dir', r2fileDir);
     const res = await fetch('/api/storage-nodes/r2-files?' + params.toString());
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
@@ -4074,8 +4189,9 @@ async function loadNodeR2Files() {
     }
 
     const totalSize = r2fileAllObjects.reduce((sum, o) => sum + (o.size || 0), 0);
+    const dirCount = r2fileAllObjects.filter(o => o.isDir).length;
     if (stats) {
-      stats.textContent = '共 ' + r2fileAllObjects.length + ' 个对象，总大小 ' + formatSize(totalSize) +
+      stats.textContent = (dirCount ? dirCount + ' 个文件夹，' : '') + (r2fileAllObjects.length - dirCount) + ' 个文件，总大小 ' + formatSize(totalSize) +
         (r2fileTruncated ? '（还有更多...）' : '');
     }
 
@@ -4094,18 +4210,51 @@ async function loadNodeR2Files() {
 function renderNodeR2Files(objects) {
   const list = document.getElementById('r2fileList');
   if (!list) return;
-
+  list.innerHTML = '';
+  if (r2fileDir) {
+    const up = document.createElement('div');
+    up.className = 'r2file-row up';
+    up.innerHTML = '<span class="material-icons-round">arrow_upward</span><span class="r2file-key">上一级</span>';
+    up.addEventListener('click', () => {
+      const segs = r2fileDir.split('/').filter(Boolean);
+      segs.pop();
+      viewNodeR2Files(r2fileViewNodeId, r2fileViewNodeName, r2fileViewNodeType, segs.join('/'));
+    });
+    list.appendChild(up);
+  }
   if (!objects.length) {
-    list.innerHTML = '<div style="padding:24px;color:var(--on-surface-variant);text-align:center">此节点暂无文件</div>';
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:24px;color:var(--on-surface-variant);text-align:center';
+    empty.textContent = r2fileDir ? '这个文件夹是空的' : '此节点暂无文件';
+    list.appendChild(empty);
     return;
   }
-
-  list.innerHTML = objects.map(function(o) {
-    return '<div class="r2file-row">' +
-      '<span class="r2file-key" title="' + escapeHtml(o.key) + '">' + escapeHtml(o.key) + '</span>' +
-      '<span class="r2file-size">' + formatSize(o.size) + '</span>' +
-      '</div>';
-  }).join('');
+  objects.forEach(o => {
+    const row = document.createElement('div');
+    row.className = 'r2file-row' + (o.isDir ? ' dir' : '');
+    if (o.isDir) {
+      const ic = document.createElement('span');
+      ic.className = 'material-icons-round';
+      ic.textContent = 'folder';
+      row.appendChild(ic);
+    }
+    const key = document.createElement('span');
+    key.className = 'r2file-key';
+    key.title = o.key;
+    key.textContent = o.key;
+    row.appendChild(key);
+    if (!o.isDir) {
+      const size = document.createElement('span');
+      size.className = 'r2file-size';
+      size.textContent = formatSize(o.size);
+      row.appendChild(size);
+    } else {
+      row.addEventListener('click', () => {
+        viewNodeR2Files(r2fileViewNodeId, r2fileViewNodeName, r2fileViewNodeType, (r2fileDir ? r2fileDir + '/' : '') + o.key);
+      });
+    }
+    list.appendChild(row);
+  });
 }
 
 function createFolder() {
@@ -5748,6 +5897,10 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
         <h4>拖放文件到此处</h4>
         <p>或点击选择文件，支持多文件同时上传</p>
       </div>
+      <div class="upload-target-row">
+        <label class="field-label" for="uploadTargetSelect" style="margin:0">上传到</label>
+        <select class="text-field" id="uploadTargetSelect" onchange="setUploadTarget(this.value)"></select>
+      </div>
       <input type="file" id="fileInput" multiple style="display:none" onchange="handleFileInput(event)">
       <div class="progress-list" id="progressList"></div>
     </div>
@@ -6002,6 +6155,9 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
     <div class="modal-header node-modal-header">
       <span class="material-icons-round" style="color:var(--primary)">hub</span>
       <span class="modal-title">存储节点</span>
+      <button class="icon-btn" id="nodeRefreshBtn" title="刷新容量" onclick="loadStorageNodes(true)">
+        <span class="material-icons-round">refresh</span>
+      </button>
       <button class="btn-outlined node-add-btn" id="nodeAddBtn" onclick="toggleNodeForm()">
         <span class="material-icons-round">add</span> 添加节点
       </button>
@@ -6546,8 +6702,16 @@ async function getNodeUsageInfo(env, node) {
   return { used: estimated, total: STORAGE_TOTAL_BYTES, online, storageAvailable: false, source: 'estimate' };
 }
 
-async function listWebdavNodeFiles(node) {
-  const base = normalizeNodeUrl(node.url);
+function cleanWebdavSubdir(dir = '') {
+  const segs = String(dir || '').split('/').map(x => x.trim()).filter(Boolean);
+  if (segs.some(x => x === '..' || x === '.')) throw new Error('invalid dir');
+  return segs;
+}
+
+// 列 WebDAV 目录（dir 是相对节点地址的子目录），文件夹也返回（isDir: true）
+async function listWebdavNodeFiles(node, dir = '') {
+  const segs = cleanWebdavSubdir(dir);
+  const base = normalizeNodeUrl(node.url) + (segs.length ? '/' + segs.map(encodeURIComponent).join('/') : '');
   const res = await webdavPropfind(node, base + '/', 1, WEBDAV_LIST_PROPFIND);
   if (res.status === 404) { await discardBody(res); return []; }
   if (res.status !== 207 && res.status !== 200) {
@@ -6561,20 +6725,22 @@ async function listWebdavNodeFiles(node) {
   let m;
   while ((m = re.exec(xml))) {
     const block = m[1];
-    if (/<(?:[A-Za-z0-9_-]+:)?collection\b/i.test(block)) continue;
+    const isDir = /<(?:[A-Za-z0-9_-]+:)?collection\b/i.test(block);
     let href = xmlTagValue(block, 'href');
     if (!href) continue;
-    try { href = decodeURIComponent(new URL(href, base + '/').pathname); } catch {}
+    try { href = decodeURIComponent(new URL(href.replace(/&amp;/g, '&'), base + '/').pathname); } catch {}
     href = href.replace(/\/+$/, '');
-    if (href === basePath) continue;
+    if (href === basePath || !href) continue;
     const name = href.split('/').pop() || href;
     const modified = xmlTagValue(block, 'getlastmodified');
     objects.push({
       key: name,
-      size: Math.max(0, Number(xmlTagValue(block, 'getcontentlength') || 0)),
+      isDir,
+      size: isDir ? 0 : Math.max(0, Number(xmlTagValue(block, 'getcontentlength') || 0)),
       uploaded: modified && !isNaN(Date.parse(modified)) ? new Date(modified).toISOString() : ''
     });
   }
+  objects.sort((a, b) => (a.isDir === b.isDir ? a.key.localeCompare(b.key) : (a.isDir ? -1 : 1)));
   return objects;
 }
 
@@ -10719,7 +10885,7 @@ export default {
         if (!node) return jsonResponse({ ok: false, error: 'node not found' }, 404);
 
         if (node.type === 'webdav') {
-          const objects = await listWebdavNodeFiles(node);
+          const objects = await listWebdavNodeFiles(node, url.searchParams.get('dir') || '');
           return jsonResponse({ objects, cursor: null, truncated: false });
         }
 
@@ -11071,7 +11237,9 @@ export default {
       if (!filePath || fileSize <= 0 || chunkSize <= 0 || totalParts <= 0) {
         return jsonResponse({ ok: false, error: 'missing fields' }, 400);
       }
-      if (fileSize <= DISTRIBUTED_UPLOAD_THRESHOLD_BYTES) {
+      const targetNodeId = String(body.targetNodeId || '').trim();
+      // 指定了目标节点时小文件也走这里（整份存到那个节点）
+      if (!targetNodeId && fileSize <= DISTRIBUTED_UPLOAD_THRESHOLD_BYTES) {
         return jsonResponse({ ok: false, error: 'file below distributed threshold' }, 409);
       }
       // 分片参数必须自洽：否则可以声明很小的文件、很多分片，让后面的分片大小算成 0 而跳过大小校验
@@ -11081,7 +11249,15 @@ export default {
       }
       const cleanPath = assertVirtualPath(filePath);
       if (isNotesPath(cleanPath)) return jsonResponse({ ok: false, error: 'notes are private' }, 400);
-      const nodes = [mainStorageNode(), ...await getStorageNodes(env)];
+      let nodes = [mainStorageNode(), ...await getStorageNodes(env)];
+      if (targetNodeId) {
+        nodes = nodes.filter(n => n.id === targetNodeId);
+        if (!nodes.length) return jsonResponse({ ok: false, code: 'TARGET_NODE', error: '目标节点不存在或已停用' }, 400);
+        if (targetNodeId !== MAIN_STORAGE_NODE_ID) {
+          const info = await getNodeUsageInfo(env, nodes[0]).catch(() => ({ online: false }));
+          if (!info.online) return jsonResponse({ ok: false, code: 'TARGET_NODE', error: '目标节点「' + nodes[0].name + '」连不上' }, 502);
+        }
+      }
 
       const sessionId = crypto.randomUUID();
       const now = new Date().toISOString();
