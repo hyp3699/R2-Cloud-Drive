@@ -4035,6 +4035,8 @@ function renderStorageNodes(nodes, at) {
       let note = pct + '%';
       if (node.storageAvailable === false) note = '容量未知 · ' + note;
       else if (node.source === 'manual') note = '手动设定 · ' + note;
+      else if (node.source === 'quota') note = '网盘报告 · ' + note;
+      else if (node.source === 'default') note = '未报告容量，按 10 GB · ' + note;
       right.textContent = note;
       cap.append(left, right);
       card.append(bar, cap);
@@ -6247,7 +6249,7 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
           </div>
           <div class="full node-field-webdav" style="display:none">
             <label class="field-label" for="nodeCapInput">分给网盘的容量（GB，可不填）</label>
-            <input class="text-field" id="nodeCapInput" type="number" min="0" step="0.1" inputmode="decimal" placeholder="不填则读取网盘报告的容量，读不到按 10 GB">
+            <input class="text-field" id="nodeCapInput" type="number" min="0" step="0.1" inputmode="decimal" placeholder="不填则自动读取网盘总容量，读不到按 10 GB">
           </div>
         </div>
         <div class="node-form-hint" id="nodeFormHint">填另一个账号部署的本网盘 Worker 地址，以及它的 STORAGE_NODE_TOKEN。</div>
@@ -6693,38 +6695,86 @@ async function ensureWebdavDir(node, force = false) {
   webdavDirReady.add(base);
 }
 
+// 读一个 WebDAV 地址的配额（RFC 4331：quota-used-bytes / quota-available-bytes）
+async function readWebdavQuota(node, url) {
+  const res = await webdavPropfind(node, url, 0, WEBDAV_QUOTA_PROPFIND);
+  if (res.status !== 207 && res.status !== 200) {
+    await discardBody(res);
+    return { status: res.status };
+  }
+  const xml = await res.text();
+  const num = tag => {
+    const v = xmlTagValue(xml, tag);
+    if (v === '') return NaN;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : NaN;
+  };
+  return { status: res.status, used: num('quota-used-bytes'), avail: num('quota-available-bytes') };
+}
+
+// 没有配额信息时，把网盘目录里所有文件大小加起来（Depth: infinity，服务器不允许就放弃）
+async function sumWebdavDirSize(node) {
+  try {
+    const res = await webdavPropfind(node, normalizeNodeUrl(node.url) + '/', 'infinity', WEBDAV_LIST_PROPFIND);
+    if (res.status !== 207) { await discardBody(res); return NaN; }
+    const xml = await res.text();
+    let total = 0;
+    const re = /<(?:[A-Za-z0-9_-]+:)?getcontentlength(?:\s[^>]*)?>\s*(\d+)\s*</gi;
+    let m;
+    while ((m = re.exec(xml))) total += Number(m[1]);
+    return total;
+  } catch {
+    return NaN;
+  }
+}
+
 // 节点容量：返回 { used, total, online, storageAvailable, source }
-// WebDAV：填了总容量 → 上限按填的算，已用按本网盘写进去的分片累计；
-//         没填 → 用服务器报告的配额（quota-used / quota-available）；都没有 → 默认 10GB + 累计值
-async function getNodeUsageInfo(env, node) {
+// WebDAV：先问网盘目录的配额，没有就逐级往上问（很多网盘只在根目录报告整个账号的配额）；
+//   已用：网盘报告的已用 → 目录文件合计 → 本网盘写入的累计值
+//   总量：手动填写 → 网盘报告（已用 + 剩余）→ 默认 10 GB
+async function getNodeUsageInfo(env, node, opts = {}) {
   if (node.type === 'webdav') {
-    const estimated = await getStoredNodeUsage(env, node.id).catch(() => 0);
+    const base = normalizeNodeUrl(node.url);
     let online = false;
     let qUsed = NaN;
     let qAvail = NaN;
     try {
-      const res = await webdavPropfind(node, normalizeNodeUrl(node.url) + '/', 0, WEBDAV_QUOTA_PROPFIND);
-      if (res.status === 207 || res.status === 200) {
-        online = true;
-        const xml = await res.text();
-        qUsed = Number(xmlTagValue(xml, 'quota-used-bytes'));
-        qAvail = Number(xmlTagValue(xml, 'quota-available-bytes'));
-      } else if (res.status === 404) {
-        // 目录还没建：服务器能连上，第一次上传时会自动创建
-        online = true;
-        await discardBody(res);
-      } else {
-        await discardBody(res);
+      const u = new URL(base + '/');
+      const segs = u.pathname.split('/').filter(Boolean);
+      // 从网盘目录往上，最多问 4 层
+      for (let i = segs.length, tries = 0; i >= 0 && tries < 4; i--, tries++) {
+        const url = u.origin + '/' + segs.slice(0, i).join('/') + (i ? '/' : '');
+        const q = await readWebdavQuota(node, url).catch(() => null);
+        if (!q) continue;
+        if (q.status === 207 || q.status === 200 || q.status === 404) online = true;
+        if (q.status === 401) break;
+        if (Number.isFinite(q.used) && !Number.isFinite(qUsed)) qUsed = q.used;
+        if (Number.isFinite(q.avail) && !Number.isFinite(qAvail)) qAvail = q.avail;
+        if (Number.isFinite(qUsed) && Number.isFinite(qAvail)) break;
       }
     } catch {}
-    const hasQuota = Number.isFinite(qUsed) && qUsed >= 0 && Number.isFinite(qAvail) && qAvail >= 0 && (qUsed + qAvail) > 0;
+
+    let used = qUsed;
+    let usedSource = 'quota';
+    if (!Number.isFinite(used) && online && opts.scan) {
+      used = await sumWebdavDirSize(node);
+      usedSource = 'scan';
+    }
+    if (!Number.isFinite(used)) {
+      used = await getStoredNodeUsage(env, node.id).catch(() => 0);
+      usedSource = 'estimate';
+    }
+
     if (node.capacityBytes > 0) {
-      return { used: estimated, total: node.capacityBytes, online, storageAvailable: true, source: 'manual' };
+      return { used, total: node.capacityBytes, online, storageAvailable: true, source: 'manual', usedSource };
     }
-    if (hasQuota) {
-      return { used: qUsed, total: qUsed + qAvail, online, storageAvailable: true, source: 'quota' };
+    if (Number.isFinite(qAvail) && usedSource === 'quota' && (qUsed + qAvail) > 0) {
+      return { used, total: qUsed + qAvail, online, storageAvailable: true, source: 'quota', usedSource };
     }
-    return { used: estimated, total: STORAGE_TOTAL_BYTES, online, storageAvailable: online, source: 'default' };
+    if (Number.isFinite(qAvail) && qAvail > 0) {
+      return { used, total: used + qAvail, online, storageAvailable: true, source: 'quota', usedSource };
+    }
+    return { used, total: STORAGE_TOTAL_BYTES, online, storageAvailable: online, source: 'default', usedSource };
   }
 
   let online = false;
@@ -10823,7 +10873,7 @@ export default {
           used: mainUsed, total: storageTotalBytes(env), online: true, storageAvailable: true, source: 'r2'
         };
         const withUsage = await Promise.all(safeNodes.map(async n => {
-          const info = await getNodeUsageInfo(env, n).catch(() => ({ used: 0, total: STORAGE_TOTAL_BYTES, online: false, storageAvailable: false, source: 'error' }));
+          const info = await getNodeUsageInfo(env, n, { scan: true }).catch(() => ({ used: 0, total: STORAGE_TOTAL_BYTES, online: false, storageAvailable: false, source: 'error' }));
           return { ...publicNode(n), ...info };
         }));
         return jsonResponse({ nodes: [main, ...withUsage] });
