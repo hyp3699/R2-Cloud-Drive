@@ -11927,11 +11927,12 @@ export default {
       for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
         const node = allocatedNodes[partNumber - 1];
         const dav = davRoots.get(node.id);
-        const partKey = dav
-          ? webdavPartKey(dav.root, partNumber, totalParts)
-          : NODE_DATA_FOLDER + '/' + NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
         const partSize = partSizes[partNumber - 1];
         const isMain = node.id === MAIN_STORAGE_NODE_ID || node.storageType === 'r2';
+        // 主控 R2 的分片照旧放根目录；其他存储桶放进「R2网盘」文件夹
+        const partKey = dav
+          ? webdavPartKey(dav.root, partNumber, totalParts)
+          : (isMain ? '' : NODE_DATA_FOLDER + '/') + NODE_PART_PREFIX + sessionId + '_' + String(partNumber).padStart(6, '0');
         const isDav = !isMain && node.type === 'webdav';
         const uploadToken = crypto.randomUUID().replace(/-/g, '');
         parts.push({
