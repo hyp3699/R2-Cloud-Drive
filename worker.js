@@ -956,8 +956,13 @@ function renderHTML(content, title = 'R2 云盘') {
   .upload-target-row select { flex: 1; min-width: 0; height: 40px; padding: 0 10px; }
   #nodeRefreshBtn.spinning .material-icons-round { animation: spin 1s linear infinite; }
   .node-cache-note { font-size: 11px; color: var(--on-surface-variant); }
-  .r2file-row.dir { cursor: pointer; font-family: var(--font-body); }
-  .r2file-row.dir .material-icons-round { font-size: 18px; color: var(--warning); }
+  .r2file-row.dir, .r2file-row.file { cursor: pointer; font-family: var(--font-body); padding: 4px 4px 4px 10px; gap: 8px; }
+  .r2file-row .r2file-icon { font-size: 20px; color: var(--on-surface-variant); flex-shrink: 0; }
+  .r2file-row.dir .r2file-icon { color: var(--warning); }
+  .r2file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .r2file-row .r2file-size { font-size: 11px; }
+  .r2file-act { width: 34px; height: 34px; flex-shrink: 0; }
+  .r2file-act .material-icons-round { font-size: 19px; }
   .r2file-row.up { cursor: pointer; font-family: var(--font-body); color: var(--primary); }
   .r2file-row.up .material-icons-round { font-size: 18px; }
   .node-row-fill.full { background: var(--error); }
@@ -4207,6 +4212,37 @@ async function loadNodeR2Files() {
   }
 }
 
+function nodeFileRelPath(o) {
+  return r2fileViewNodeType === 'webdav' ? ((r2fileDir ? r2fileDir + '/' : '') + o.key) : o.key;
+}
+function nodeFileUrl(o, inline) {
+  return '/api/storage-nodes/file?id=' + encodeURIComponent(r2fileViewNodeId) +
+    '&path=' + encodeURIComponent(nodeFileRelPath(o)) + (inline ? '&inline=1' : '');
+}
+function openNodeFile(o) {
+  window.open(nodeFileUrl(o, true), '_blank');
+}
+function downloadNodeFile(o) {
+  const a = document.createElement('a');
+  a.href = nodeFileUrl(o, false);
+  a.download = o.key;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+async function deleteNodeFile(o) {
+  const isPart = /^r2drive_/.test(o.key);
+  let msg = '确定删除' + (o.isDir ? '文件夹' : '') + '「' + o.key + '」？' + (o.isDir ? '里面的内容会一起删掉。' : '');
+  if (isPart) msg += '这是网盘自己存的分片/索引，删掉后对应的网盘文件会损坏。';
+  if (!confirm(msg)) return;
+  const res = await fetch(nodeFileUrl(o, false) + (o.isDir ? '&dir=1' : ''), { method: 'DELETE', headers: CSRF_HEADER });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { showSnackbar(data.error || '删除失败'); return; }
+  showSnackbar('已删除');
+  r2fileAllObjects = r2fileAllObjects.filter(x => x !== o);
+  renderNodeR2Files(r2fileAllObjects);
+}
+
 function renderNodeR2Files(objects) {
   const list = document.getElementById('r2fileList');
   if (!list) return;
@@ -4229,30 +4265,45 @@ function renderNodeR2Files(objects) {
     list.appendChild(empty);
     return;
   }
+  const mkBtn = (iconName, tip, fn) => {
+    const b = document.createElement('button');
+    b.className = 'icon-btn r2file-act';
+    b.title = tip;
+    b.innerHTML = '<span class="material-icons-round">' + iconName + '</span>';
+    b.addEventListener('click', e => { e.stopPropagation(); fn(); });
+    return b;
+  };
   objects.forEach(o => {
     const row = document.createElement('div');
-    row.className = 'r2file-row' + (o.isDir ? ' dir' : '');
-    if (o.isDir) {
-      const ic = document.createElement('span');
-      ic.className = 'material-icons-round';
-      ic.textContent = 'folder';
-      row.appendChild(ic);
-    }
-    const key = document.createElement('span');
-    key.className = 'r2file-key';
-    key.title = o.key;
-    key.textContent = o.key;
-    row.appendChild(key);
+    row.className = 'r2file-row' + (o.isDir ? ' dir' : ' file');
+    const ic = document.createElement('span');
+    ic.className = 'material-icons-round r2file-icon';
+    ic.textContent = o.isDir ? 'folder' : 'description';
+    row.appendChild(ic);
+    const main = document.createElement('div');
+    main.className = 'r2file-key';
+    const name = document.createElement('div');
+    name.className = 'r2file-name';
+    name.title = o.key;
+    name.textContent = o.key;
+    main.appendChild(name);
     if (!o.isDir) {
-      const size = document.createElement('span');
+      const size = document.createElement('div');
       size.className = 'r2file-size';
       size.textContent = formatSize(o.size);
-      row.appendChild(size);
-    } else {
+      main.appendChild(size);
+    }
+    row.appendChild(main);
+    if (o.isDir) {
       row.addEventListener('click', () => {
         viewNodeR2Files(r2fileViewNodeId, r2fileViewNodeName, r2fileViewNodeType, (r2fileDir ? r2fileDir + '/' : '') + o.key);
       });
+    } else {
+      row.addEventListener('click', () => openNodeFile(o));
+      row.appendChild(mkBtn('open_in_new', '打开', () => openNodeFile(o)));
+      row.appendChild(mkBtn('download', '下载', () => downloadNodeFile(o)));
     }
+    row.appendChild(mkBtn('delete_outline', '删除', () => deleteNodeFile(o)));
     list.appendChild(row);
   });
 }
@@ -10855,6 +10906,78 @@ export default {
         return jsonResponse({ ok: false, ping: true, storage: false, error: 'storage unavailable' }, 502);
       }
       return jsonResponse({ ok: true, ping: true, storage: true, used: info.used, total: info.total, source: info.source });
+    }
+
+    // 节点文件：打开 / 下载 / 删除（主控 R2、Worker 节点按对象 key；WebDAV 按相对路径，可含子目录）
+    if (path === '/api/storage-nodes/file' && (request.method === 'GET' || request.method === 'HEAD' || request.method === 'DELETE')) {
+      try {
+        const id = url.searchParams.get('id') || MAIN_STORAGE_NODE_ID;
+        const rel = String(url.searchParams.get('path') || '');
+        const inline = url.searchParams.get('inline') === '1';
+        if (!rel || rel.includes('..')) return jsonResponse({ ok: false, error: 'invalid path' }, 400);
+        const filename = rel.split('/').filter(Boolean).pop() || 'file';
+        const contentType = getMimeType(filename);
+
+        if (id === MAIN_STORAGE_NODE_ID) {
+          if (request.method === 'DELETE') {
+            await R2.delete(rel);
+            return jsonResponse({ ok: true });
+          }
+          const meta = await R2.head(rel);
+          if (!meta) return new Response('Not found', { status: 404 });
+          const range = parseByteRange(request.headers.get('Range'), meta.size || 0);
+          if (range?.invalid) return rangeNotSatisfiableResponse(meta.size || 0);
+          const obj = request.method === 'HEAD' ? null : await R2.get(rel, r2RangeOptions(range));
+          return new Response(obj ? obj.body : null, {
+            status: range ? 206 : 200,
+            headers: fileResponseHeaders({ contentType, filename, size: meta.size || 0, range, inline })
+          });
+        }
+
+        const nodes = await getStorageNodes(env, true);
+        const node = nodes.find(item => item.id === id);
+        if (!node) return jsonResponse({ ok: false, error: 'node not found' }, 404);
+
+        let upstreamUrl;
+        let upstreamHeaders;
+        if (node.type === 'webdav') {
+          const segs = cleanWebdavSubdir(rel);
+          if (!segs.length) return jsonResponse({ ok: false, error: 'invalid path' }, 400);
+          const isDir = url.searchParams.get('dir') === '1';
+          upstreamUrl = normalizeNodeUrl(node.url) + '/' + segs.map(encodeURIComponent).join('/') + (isDir ? '/' : '');
+          upstreamHeaders = webdavAuthHeaders(node);
+        } else {
+          upstreamUrl = node.url + '/api/node/part?key=' + encodeURIComponent(rel);
+          upstreamHeaders = getNodeAuthHeaders(node);
+        }
+
+        if (request.method === 'DELETE') {
+          const res = await fetch(upstreamUrl, { method: 'DELETE', headers: upstreamHeaders });
+          await discardBody(res);
+          if (!res.ok && res.status !== 404) return jsonResponse({ ok: false, error: '删除失败 (HTTP ' + res.status + ')' }, 502);
+          return jsonResponse({ ok: true });
+        }
+
+        const range = request.headers.get('Range');
+        const res = await fetch(upstreamUrl, {
+          method: request.method,
+          headers: range ? { ...upstreamHeaders, Range: range } : upstreamHeaders
+        });
+        if (!res.ok) {
+          await discardBody(res);
+          return new Response('节点返回 HTTP ' + res.status, { status: res.status === 404 ? 404 : 502 });
+        }
+        const headers = fileResponseHeaders({ contentType, filename, size: 0, inline });
+        headers.delete('Content-Length');
+        for (const h of ['Content-Length', 'Content-Range', 'Accept-Ranges', 'ETag', 'Last-Modified']) {
+          const v = res.headers.get(h);
+          if (v) headers.set(h, v);
+        }
+        return new Response(request.method === 'HEAD' ? null : res.body, { status: res.status, headers });
+      } catch (err) {
+        console.error('node file failed:', err?.message || err);
+        return jsonResponse({ ok: false, error: err?.message || 'node file failed' }, 500);
+      }
     }
 
     // R2 file viewer — list objects for main or external storage node
