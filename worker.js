@@ -514,6 +514,20 @@ function renderHTML(content, title = 'R2 云盘') {
     border: 1px solid var(--outline); border-radius: var(--radius-m);
     background: rgba(60,64,67,.04);
   }
+  .share-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .share-tabs button { flex: 1; height: 36px; border-radius: 18px; border: 1px solid var(--outline); background: var(--surface); color: var(--on-surface); font: inherit; font-size: 14px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+  .share-tabs button.active { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
+  .share-tabs .material-icons-round { font-size: 18px; }
+  #directModal .modal { max-width: 720px; max-height: calc(100dvh - 48px); display: flex; flex-direction: column; }
+  #directModal .modal-body { overflow-y: auto; min-height: 0; }
+  #directModal .modal-header, #directModal .modal-footer { flex-shrink: 0; }
+  #directModal .modal-footer { flex-wrap: wrap; }
+  #directModal .share-records { max-height: none; overflow: visible; }
+  #directModal .share-record-meta { overflow-wrap: anywhere; }
+  .direct-status { font-size: 14px; margin: 4px 0 12px; display: flex; align-items: center; gap: 6px; }
+  .direct-status.on { color: var(--primary); }
+  .direct-status .material-icons-round { font-size: 18px; }
+  .direct-action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
   #shareModal .modal { max-width: 720px; max-height: calc(100dvh - 48px); display: flex; flex-direction: column; }
   #shareModal .modal-body { overflow-y: auto; min-height: 0; }
   #githubSyncModal .modal { max-height: calc(100dvh - 48px); display: flex; flex-direction: column; }
@@ -1301,14 +1315,8 @@ ${content}
   <div class="context-menu-item" onclick="ctxDetails()">
     <span class="material-icons-round">info_outline</span><span>详情</span>
   </div>
-  <div class="context-menu-item" id="ctxCopyLinkItem" onclick="ctxCopyLink()">
-    <span class="material-icons-round">link</span><span>复制链接</span>
-  </div>
-  <div class="context-menu-item" id="ctxDirectToggle" onclick="ctxToggleDirectLink()">
-    <span class="material-icons-round" id="ctxDirectIcon">link_off</span><span id="ctxDirectText">已关闭直连点击开启</span>
-  </div>
-  <div class="context-menu-item" id="ctxResetDirectItem" onclick="ctxResetDirectLink()">
-    <span class="material-icons-round">refresh</span><span>重置直连</span>
+  <div class="context-menu-item" id="ctxDirectManageItem" onclick="ctxDirectManage()">
+    <span class="material-icons-round">link</span><span>直连管理</span>
   </div>
   <div class="context-menu-divider"></div>
   <div class="context-menu-item danger" onclick="ctxDelete()">
@@ -2783,12 +2791,9 @@ function showCtxMenu(e, name, isFolder) {
   ctxTarget = name;
   const menu = document.getElementById('contextMenu');
   if (!menu) return;
-  // 直连只对文件有效：文件夹不显示这三项；文件打开菜单时查一下当前直连状态
-  ['ctxCopyLinkItem', 'ctxDirectToggle', 'ctxResetDirectItem'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.style.display = isFolder ? 'none' : '';
-  });
-  if (!isFolder) refreshCtxDirectState(currentPath ? currentPath + '/' + name : name);
+  // 直连只对文件有效：文件夹不显示「直连管理」
+  const directItem = document.getElementById('ctxDirectManageItem');
+  if (directItem) directItem.style.display = isFolder ? 'none' : '';
 
   // 先让菜单可见并移到屏幕外，以便测量真实尺寸
   menu.classList.add('open');
@@ -2923,100 +2928,260 @@ function ctxRename() {
   fetch('/api/rename', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({from: oldPath, to: newPath}) })
     .then(r => r.ok ? (showSnackbar('已重命名'), location.reload()) : showSnackbar('重命名失败'));
 }
-// 直连默认关闭：右键菜单里显示当前状态，点一下切换
-let ctxDirectState = { path: '', enabled: false, seq: 0 };
-function setCtxDirectToggle(enabled, loading) {
-  const item = document.getElementById('ctxDirectToggle');
-  const icon = document.getElementById('ctxDirectIcon');
-  const text = document.getElementById('ctxDirectText');
-  if (!item || !icon || !text) return;
-  if (loading) { item.classList.remove('danger'); icon.textContent = 'link'; text.textContent = '正在查询直连状态…'; return; }
-  item.classList.toggle('danger', !!enabled);
-  icon.textContent = enabled ? 'link_off' : 'link';
-  text.textContent = enabled ? '已开启直连点击关闭' : '已关闭直连点击开启';
-}
-async function refreshCtxDirectState(path) {
-  const seq = ++ctxDirectState.seq;
-  ctxDirectState.path = path;
-  ctxDirectState.enabled = false;
-  ctxDirectState.known = false;
-  setCtxDirectToggle(false, true);
-  try {
-    const res = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
-    const data = await res.json().catch(() => ({}));
-    if (seq !== ctxDirectState.seq) return;
-    ctxDirectState.enabled = !!(res.ok && data.enabled && data.url);
-  } catch {
-    if (seq !== ctxDirectState.seq) return;
-  }
-  ctxDirectState.known = true;
-  setCtxDirectToggle(ctxDirectState.enabled, false);
-}
-async function ctxToggleDirectLink() {
+// ── 直连管理 ──
+// 右键「直连管理」打开单个文件的直连设置；分享管理里的「直连」页列出全部已开启的直连。
+let directModalPath = '';
+let directModalInfo = null;
+let directListCache = [];
+let directFromList = false;
+let directLoadSeq = 0;
+function ctxDirectManage() {
   if (!ctxTarget) return;
   const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
-  // 状态还没查回来时先查一次，避免点错方向
-  if (ctxDirectState.path !== path || !ctxDirectState.known) {
-    try {
-      const r = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
-      const d = await r.json().catch(() => ({}));
-      ctxDirectState = { path, enabled: !!(r.ok && d.enabled && d.url), known: true, seq: ctxDirectState.seq + 1 };
-    } catch {}
-  }
-  if (ctxDirectState.enabled) {
-    try {
-      const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'close' }) });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'close failed');
-      ctxDirectState.enabled = false;
-      showSnackbar('直连已关闭，旧链接立即失效');
-    } catch (err) {
-      showSnackbar('关闭直连失败：' + (err.message || '未知错误'));
-    }
-  } else {
-    try {
-      const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'enable' }) });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.url) throw new Error(data.error || 'enable failed');
-      ctxDirectState.enabled = true;
-      try { await navigator.clipboard.writeText(location.origin + data.url); showSnackbar('直连已开启，链接已复制'); }
-      catch { showSnackbar('直连已开启，可在「复制链接」里复制'); }
-    } catch (err) {
-      showSnackbar('开启直连失败：' + (err.message || '未知错误'));
-    }
-  }
+  closeCtxMenuSafe();
+  openDirectModal(path, false);
 }
-async function ctxCopyLink() {
-  if (!ctxTarget) return;
-  const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
+function closeCtxMenuSafe() {
+  document.getElementById('contextMenu')?.classList.remove('open');
+}
+function openDirectManager() {
+  closeShareModal();
+  openDirectModal('', false);
+}
+function openDirectModal(path, fromList) {
+  directModalPath = path || '';
+  directFromList = !!fromList;
+  directModalInfo = null;
+  document.getElementById('directModal')?.classList.add('open');
+  if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  renderDirectModal();
+  if (directModalPath) loadDirectInfo();
+  else loadDirectList();
+}
+function closeDirectModal() {
+  directLoadSeq++;
+  document.getElementById('directModal')?.classList.remove('open');
+}
+function switchToShareManager() {
+  closeDirectModal();
+  openShareManager();
+}
+function directDailyText(info) {
+  const today = Number(info?.todayDownloads || 0);
+  return info?.dailyLimit ? ('今日下载 ' + today + ' / ' + info.dailyLimit + ' 次') : ('今日下载 ' + today + ' 次 · 每日不限');
+}
+function renderDirectModal() {
+  const single = !!directModalPath;
+  document.getElementById('directModalTitle').textContent = single ? '直连管理' : '直连管理（全部）';
+  document.getElementById('directTabs').style.display = single && !directFromList ? 'none' : '';
+  document.getElementById('directSingle').style.display = single ? '' : 'none';
+  document.getElementById('directListWrap').style.display = single ? 'none' : '';
+  document.getElementById('directBackBtn').style.display = single && directFromList ? '' : 'none';
+  if (!single) return;
+  document.getElementById('directTargetPath').textContent = directModalPath;
+  const info = directModalInfo;
+  const status = document.getElementById('directStatus');
+  const linkRow = document.getElementById('directLinkWrap');
+  const toggleBtn = document.getElementById('directToggleBtn');
+  const resetBtn = document.getElementById('directResetBtn');
+  const limitInput = document.getElementById('directDailyLimitInput');
+  const today = document.getElementById('directTodayText');
+  if (!info) {
+    status.className = 'direct-status';
+    status.innerHTML = '<span class="material-icons-round">sync</span> 正在查询直连状态…';
+    linkRow.style.display = 'none';
+    toggleBtn.disabled = true; resetBtn.disabled = true;
+    return;
+  }
+  toggleBtn.disabled = false;
+  const on = !!(info.enabled && info.url);
+  status.className = 'direct-status' + (on ? ' on' : '');
+  status.innerHTML = on
+    ? '<span class="material-icons-round">link</span> 直连已开启，任何人拿到链接都能免登录下载'
+    : '<span class="material-icons-round">link_off</span> 直连已关闭';
+  linkRow.style.display = on ? '' : 'none';
+  document.getElementById('directLinkInput').value = on ? location.origin + info.url : '';
+  toggleBtn.innerHTML = on
+    ? '<span class="material-icons-round">link_off</span> 关闭直连'
+    : '<span class="material-icons-round">link</span> 开启直连';
+  toggleBtn.classList.toggle('danger', on);
+  resetBtn.disabled = !on;
+  if (limitInput && document.activeElement !== limitInput) limitInput.value = info.dailyLimit || '';
+  today.textContent = on ? directDailyText(info) : '开启直连后才计数；关闭时也会保留每日次数设置';
+}
+async function loadDirectInfo() {
+  const seq = ++directLoadSeq;
   try {
-    const res = await fetch('/api/direct-link?path=' + encodeURIComponent(path));
+    const res = await fetch('/api/direct-link?path=' + encodeURIComponent(directModalPath));
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'direct link failed');
-    // 直连默认关闭：复制链接不再自动开启
-    if (!data.enabled || !data.url) { showSnackbar('该文件直连未开启，请先点「已关闭直连点击开启」'); return; }
-    const url = location.origin + data.url;
-    await navigator.clipboard.writeText(url).catch(function() {});
-    showSnackbar('直连链接已复制，关闭或重置后旧链接立即失效');
+    if (seq !== directLoadSeq) return;
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    directModalInfo = data;
   } catch (err) {
-    showSnackbar('复制直连失败：' + (err.message || '未知错误'));
+    if (seq !== directLoadSeq) return;
+    directModalInfo = { enabled: false, url: '' };
+    showSnackbar('查询直连失败：' + (err.message || '未知错误'));
   }
+  renderDirectModal();
 }
-async function ctxResetDirectLink() {
-  if (!ctxTarget) return;
-  const path = currentPath ? currentPath + '/' + ctxTarget : ctxTarget;
+function readDirectDailyLimit() {
+  const raw = String(document.getElementById('directDailyLimitInput')?.value || '').trim();
+  const n = Number(raw || 0);
+  if (!Number.isInteger(n) || n < 0) { showSnackbar('每日下载次数格式不正确'); return null; }
+  return n;
+}
+async function postDirectAction(action, extra) {
+  const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(Object.assign({ path: directModalPath, action }, extra || {})) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+async function directToggle() {
+  if (!directModalPath || !directModalInfo) return;
+  const on = !!(directModalInfo.enabled && directModalInfo.url);
   try {
-    const cur = await fetch('/api/direct-link?path=' + encodeURIComponent(path)).then(r => r.json()).catch(() => ({}));
-    if (!cur.enabled) { showSnackbar('该文件直连未开启，无需重置'); return; }
-    const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path, action: 'reset' }) });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.url) throw new Error(data.error || 'reset failed');
-    const url = location.origin + data.url;
-    await navigator.clipboard.writeText(url).catch(function() {});
+    if (on) {
+      await postDirectAction('close');
+      showSnackbar('直连已关闭，旧链接立即失效');
+    } else {
+      const limit = readDirectDailyLimit();
+      if (limit === null) return;
+      const data = await postDirectAction('enable', { dailyLimit: limit });
+      try { await navigator.clipboard.writeText(location.origin + data.url); showSnackbar('直连已开启，链接已复制'); }
+      catch { showSnackbar('直连已开启'); }
+    }
+  } catch (err) {
+    showSnackbar((on ? '关闭直连失败：' : '开启直连失败：') + (err.message || '未知错误'));
+  }
+  await loadDirectInfo();
+}
+async function directReset() {
+  if (!directModalPath) return;
+  try {
+    const data = await postDirectAction('reset');
+    await navigator.clipboard.writeText(location.origin + data.url).catch(function() {});
     showSnackbar('直连已重置，旧链接已失效，新链接已复制');
   } catch (err) {
     showSnackbar('重置直连失败：' + (err.message || '未知错误'));
   }
+  await loadDirectInfo();
+}
+async function directSaveLimit() {
+  if (!directModalPath) return;
+  const limit = readDirectDailyLimit();
+  if (limit === null) return;
+  if (!(directModalInfo && directModalInfo.enabled)) { showSnackbar('请先开启直连；开启时会按这里的次数设置'); return; }
+  try {
+    await postDirectAction('limit', { dailyLimit: limit });
+    showSnackbar(limit ? ('已设置每日最多下载 ' + limit + ' 次') : '已取消每日下载次数限制');
+  } catch (err) {
+    showSnackbar('保存失败：' + (err.message || '未知错误'));
+  }
+  await loadDirectInfo();
+}
+function copyDirectLinkInput() {
+  const v = document.getElementById('directLinkInput')?.value || '';
+  if (!v) return;
+  navigator.clipboard.writeText(v).then(() => showSnackbar('直连链接已复制')).catch(() => window.prompt('请手动复制直连链接', v));
+}
+async function loadDirectList() {
+  const seq = ++directLoadSeq;
+  const list = document.getElementById('directRecords');
+  if (list) list.innerHTML = '<div class="share-record-empty">正在加载直连列表...</div>';
+  try {
+    const res = await fetch('/api/direct-links');
+    const data = await res.json().catch(() => ({}));
+    if (seq !== directLoadSeq) return;
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    directListCache = Array.isArray(data.links) ? data.links : [];
+    renderDirectList();
+  } catch (err) {
+    if (seq !== directLoadSeq) return;
+    if (list) {
+      list.innerHTML = '';
+      const msg = document.createElement('div');
+      msg.className = 'share-record-empty';
+      msg.textContent = '直连列表加载失败：' + (err.message || '未知错误');
+      list.appendChild(msg);
+    }
+  }
+}
+function renderDirectList() {
+  const list = document.getElementById('directRecords');
+  if (!list) return;
+  if (!list.dataset.delegated) {
+    list.dataset.delegated = '1';
+    list.addEventListener('click', function(e) {
+      const btn = e.target.closest('[data-direct-action]');
+      if (!btn) return;
+      e.preventDefault(); e.stopPropagation();
+      const item = directListCache[Number(btn.dataset.directIndex)];
+      if (!item) return;
+      directListAction(btn.dataset.directAction, item);
+    });
+  }
+  const q = (document.getElementById('directSearchInput')?.value || '').trim().toLowerCase();
+  const items = directListCache.map((item, i) => [item, i]).filter(([item]) => !q || item.path.toLowerCase().includes(q));
+  if (!items.length) {
+    list.innerHTML = '<div class="share-record-empty">' + (directListCache.length ? '没有匹配的直连' : '暂无已开启的直连') + '</div>';
+    return;
+  }
+  list.innerHTML = '';
+  items.forEach(([item, index]) => {
+    const row = document.createElement('div');
+    row.className = 'share-record-row';
+    const top = document.createElement('div');
+    top.className = 'share-record-top';
+    const icon = document.createElement('span');
+    icon.className = 'material-icons-round';
+    icon.textContent = 'link';
+    const url = document.createElement('div');
+    url.className = 'share-record-url';
+    url.textContent = item.path;
+    url.title = location.origin + item.url;
+    top.append(icon, url);
+    const meta = document.createElement('div');
+    meta.className = 'share-record-meta';
+    meta.textContent = directDailyText(item) + ' · 开启于 ' + formatDate(item.createdAt) + (item.missing ? ' · 文件已不存在' : '');
+    const actions = document.createElement('div');
+    actions.className = 'share-record-actions';
+    [['content_copy', '复制', 'copy'], ['tune', '设置', 'edit'], ['refresh', '重置', 'reset'], ['link_off', '关闭', 'close']].forEach(([ic, label, action]) => {
+      const b = document.createElement('button');
+      b.className = 'btn-outlined';
+      b.type = 'button';
+      b.dataset.directAction = action;
+      b.dataset.directIndex = String(index);
+      b.innerHTML = '<span class="material-icons-round">' + ic + '</span> ' + label;
+      actions.appendChild(b);
+    });
+    row.append(top, meta, actions);
+    list.appendChild(row);
+  });
+}
+async function directListAction(action, item) {
+  if (action === 'copy') {
+    const v = location.origin + item.url;
+    navigator.clipboard.writeText(v).then(() => showSnackbar('直连链接已复制')).catch(() => window.prompt('请手动复制直连链接', v));
+    return;
+  }
+  if (action === 'edit') { openDirectModal(item.path, true); return; }
+  try {
+    const res = await fetch('/api/direct-link', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path: item.path, action: action === 'reset' ? 'reset' : 'close' }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    if (action === 'reset') {
+      await navigator.clipboard.writeText(location.origin + data.url).catch(function() {});
+      showSnackbar('直连已重置，旧链接已失效，新链接已复制');
+    } else {
+      showSnackbar('直连已关闭，旧链接立即失效');
+    }
+  } catch (err) {
+    showSnackbar((action === 'reset' ? '重置失败：' : '关闭失败：') + (err.message || '未知错误'));
+  }
+  loadDirectList();
+}
+function directBackToList() {
+  openDirectModal('', false);
 }
 let shareTargetPathValue = '';
 let createdShareLink = '';
@@ -3044,6 +3209,7 @@ function openShareModal(path) {
   document.getElementById('shareModalTitle').textContent = shareManagerMode ? '分享管理' : '分享设置';
   document.getElementById('shareSearchInput').value = '';
   document.getElementById('shareSearchInput').style.display = shareManagerMode ? '' : 'none';
+  document.getElementById('shareTabs').style.display = shareManagerMode ? '' : 'none';
   if (result) result.classList.remove('open');
   if (linkInput) linkInput.value = '';
   modal?.classList.add('open');
@@ -3082,6 +3248,8 @@ function resetShareForm() {
   }
   if (days) days.value = '';
   if (maxAccess) maxAccess.value = '';
+  const dailyInput = document.getElementById('shareDailyLimitInput');
+  if (dailyInput) dailyInput.value = '';
   if (clearPassword) clearPassword.checked = false;
   if (clearLabel) clearLabel.style.display = 'none';
   if (hint) hint.textContent = '创建新分享时留空表示无需密码';
@@ -3110,6 +3278,8 @@ async function submitShareForm() {
   const maxAccesses = Number(String(maxRaw).trim() || 0);
   if (!Number.isFinite(days) || days < 0) { showSnackbar('有效天数格式不正确'); return; }
   if (!Number.isInteger(maxAccesses) || maxAccesses < 0) { showSnackbar('访问次数格式不正确'); return; }
+  const dailyLimit = Number(String(document.getElementById('shareDailyLimitInput')?.value || '').trim() || 0);
+  if (!Number.isInteger(dailyLimit) || dailyLimit < 0) { showSnackbar('每日下载次数格式不正确'); return; }
 
   const btn = document.getElementById('shareCreateBtn');
   if (btn) {
@@ -3121,7 +3291,8 @@ async function submitShareForm() {
       path: shareTargetPathValue,
       suffix: document.getElementById('shareSuffixInput').value.trim(),
       ttlSeconds: days > 0 ? Math.round(days * 86400) : 0,
-      maxAccesses
+      maxAccesses,
+      dailyLimit
     };
     if (shareEditId) {
       const original = shareRecordsCache.find(item => item.id === shareEditId);
@@ -3196,7 +3367,9 @@ function shareMetaText(share) {
   const pwd = share.hasPassword ? '需要密码' : '无需密码';
   const reasons = { expired: '已过期', access_limit: '访问次数已用完', not_found: '分享不存在' };
   const inactive = share.inactiveReason ? (' · 已失效：' + (reasons[share.inactiveReason] || share.inactiveReason)) : '';
-  return pwd + ' · ' + expires + ' · ' + limit + inactive;
+  const today = Number(share.todayDownloads || 0);
+  const daily = share.dailyLimit ? ('今日下载 ' + today + ' / ' + share.dailyLimit + ' 次') : ('今日下载 ' + today + ' 次');
+  return pwd + ' · ' + expires + ' · ' + limit + ' · ' + daily + inactive;
 }
 function renderShareRecords(shares = []) {
   const list = document.getElementById('shareRecords');
@@ -3328,6 +3501,8 @@ function editShareRecord(id) {
   }
   if (days) days.value = daysFromExpiresAt(share.expiresAt);
   if (maxAccess) maxAccess.value = share.maxAccesses || '';
+  const dailyInput = document.getElementById('shareDailyLimitInput');
+  if (dailyInput) dailyInput.value = share.dailyLimit || '';
   if (clearPassword) clearPassword.checked = false;
   if (clearLabel) clearLabel.style.display = share.hasPassword ? 'flex' : 'none';
   if (hint) hint.textContent = '编辑分享时，密码留空表示保持不变';
@@ -6265,6 +6440,10 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
           <div class="share-summary-path" id="shareTargetPath"></div>
         </div>
       </div>
+      <div class="share-tabs" id="shareTabs" style="display:none">
+        <button type="button" class="active"><span class="material-icons-round">ios_share</span> 分享</button>
+        <button type="button" onclick="openDirectManager()"><span class="material-icons-round">link</span> 直连</button>
+      </div>
       <input class="text-field" id="shareSearchInput" type="search" placeholder="搜索分享路径或后缀" aria-label="搜索分享" style="display:none;margin-bottom:14px" oninput="renderShareRecords(shareRecordsCache)">
       <div class="share-form-grid" id="shareFormGrid">
         <div class="full">
@@ -6290,6 +6469,11 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
           <input class="text-field" id="shareMaxAccessInput" type="number" min="0" step="1" placeholder="0">
           <div class="share-hint">0 或留空表示不限次数</div>
         </div>
+        <div>
+          <label class="field-label" for="shareDailyLimitInput">每日下载次数</label>
+          <input class="text-field" id="shareDailyLimitInput" type="number" min="0" step="1" placeholder="0">
+          <div class="share-hint">按北京时间每天 0 点重置；0 或留空表示不限</div>
+        </div>
       </div>
       <div class="share-result" id="shareResult">
         <div class="share-hint">分享链接已创建</div>
@@ -6310,6 +6494,60 @@ function renderDrivePage(folders, files, currentPath, siteTitle, cloudIconUrl = 
       <button class="fab" style="box-shadow:none" id="shareCreateBtn" onclick="submitShareForm()">
         <span class="material-icons-round">ios_share</span> 创建分享
       </button>
+    </div>
+  </div>
+</div>
+
+<!-- Direct Link Modal -->
+<div class="modal-overlay" id="directModal" onclick="if(event.target===this)closeDirectModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="material-icons-round" style="color:var(--primary)">link</span>
+      <span class="modal-title" id="directModalTitle">直连管理</span>
+    </div>
+    <div class="modal-body">
+      <div class="share-tabs" id="directTabs">
+        <button type="button" onclick="switchToShareManager()"><span class="material-icons-round">ios_share</span> 分享</button>
+        <button type="button" class="active" onclick="directBackToList()"><span class="material-icons-round">link</span> 直连</button>
+      </div>
+      <div id="directSingle">
+        <div class="share-summary">
+          <span class="material-icons-round">insert_drive_file</span>
+          <div class="share-summary-main">
+            <div class="share-summary-label">直连文件</div>
+            <div class="share-summary-path" id="directTargetPath"></div>
+          </div>
+        </div>
+        <div class="direct-status" id="directStatus"></div>
+        <div id="directLinkWrap" style="display:none">
+          <div class="share-link-row">
+            <input class="text-field" id="directLinkInput" type="text" readonly>
+            <button class="btn-outlined" type="button" onclick="copyDirectLinkInput()"><span class="material-icons-round">content_copy</span> 复制</button>
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <label class="field-label" for="directDailyLimitInput">每日下载次数</label>
+          <div class="share-link-row">
+            <input class="text-field" id="directDailyLimitInput" type="number" min="0" step="1" placeholder="0">
+            <button class="btn-outlined" type="button" onclick="directSaveLimit()"><span class="material-icons-round">save</span> 保存</button>
+          </div>
+          <div class="share-hint">按北京时间每天 0 点重置；0 或留空表示不限。断点续传不重复计数。</div>
+          <div class="share-hint" id="directTodayText"></div>
+        </div>
+        <div class="direct-action-row">
+          <button class="btn-outlined" type="button" id="directToggleBtn" onclick="directToggle()">开启直连</button>
+          <button class="btn-outlined" type="button" id="directResetBtn" onclick="directReset()"><span class="material-icons-round">refresh</span> 重置链接</button>
+        </div>
+        <div class="share-hint">关闭或重置后旧链接立即失效；重置后今日计数从 0 开始。</div>
+      </div>
+      <div id="directListWrap" style="display:none">
+        <input class="text-field" id="directSearchInput" type="search" placeholder="搜索文件路径" aria-label="搜索直连" style="margin-bottom:10px" oninput="renderDirectList()">
+        <div class="share-records" id="directRecords" style="margin-top:0;border-top:none;padding-top:0"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-outlined" id="directBackBtn" onclick="directBackToList()" style="display:none">返回列表</button>
+      <button class="btn-outlined" onclick="closeDirectModal()">关闭</button>
     </div>
   </div>
 </div>
@@ -7726,6 +7964,7 @@ function normalizeShareRecord(data) {
     expiresAt: String(data.expiresAt || ''),
     maxAccesses: Math.max(0, Number(data.maxAccesses || 0) || 0),
     accessCount: Math.max(0, Number(data.accessCount || 0) || 0),
+    dailyLimit: Math.max(0, Number(data.dailyLimit || 0) || 0),
     passwordSalt: String(data.passwordSalt || id),
     createdAt: String(data.createdAt || ''),
     updatedAt: String(data.updatedAt || '')
@@ -7743,6 +7982,7 @@ function publicShare(share) {
     expiresAt: normalized.expiresAt,
     maxAccesses: normalized.maxAccesses,
     accessCount: normalized.accessCount,
+    dailyLimit: normalized.dailyLimit,
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
     url: '/s/' + normalized.id,
@@ -7803,6 +8043,52 @@ async function verifySharePassword(share, password, env) {
   return constantTimeEqual(expected, share.passwordHash);
 }
 
+// ── 每日下载次数（分享与直连共用）──
+// 计数键 dl_daily:<kind>:<id>:<北京时间日期>，两天后自动过期；按北京时间 0 点换日。
+// 只有从头开始的 GET 才计数（断点续传 / 视频拖动的 Range 后续请求不重复计）。
+// KV 不是原子计数，并发很高时可能多放过几次，属于近似限制。
+const DAILY_DOWNLOAD_PREFIX = 'dl_daily:';
+function shanghaiDateKey(ts = Date.now()) {
+  return new Date(ts + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function dailyDownloadKey(kind, id) {
+  return DAILY_DOWNLOAD_PREFIX + kind + ':' + String(id || '').toLowerCase() + ':' + shanghaiDateKey();
+}
+function parseDailyLimit(value) {
+  const n = Number(value || 0);
+  if (!n) return 0;
+  if (!Number.isInteger(n) || n < 1 || n > 1000000) throw new Error('invalid dailyLimit');
+  return n;
+}
+async function getDailyDownloadCount(env, kind, id) {
+  const raw = await kvGetRaw(env, dailyDownloadKey(kind, id));
+  return Math.max(0, Number(raw || 0) || 0);
+}
+function isFreshDownloadRequest(request) {
+  if (request.method !== 'GET') return false;
+  const range = request.headers.get('Range') || '';
+  return !range || /^bytes=0-/.test(range);
+}
+// 返回 true 表示允许；超限返回 false。limit=0 也计数（方便在管理界面看今日下载量）。
+async function consumeDailyDownload(env, kind, id, limit, request) {
+  const count = await getDailyDownloadCount(env, kind, id);
+  if (limit && count >= limit) return false;
+  if (!isFreshDownloadRequest(request)) return true;
+  await kvPutRaw(env, dailyDownloadKey(kind, id), String(count + 1), { expirationTtl: 2 * 86400 });
+  return true;
+}
+function dailyLimitResponse() {
+  return new Response('今日下载次数已用完，请明天（北京时间 0 点后）再试', {
+    status: 429,
+    headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Cache-Control': 'no-store', 'Retry-After': String(secondsUntilShanghaiMidnight()) }
+  });
+}
+function secondsUntilShanghaiMidnight() {
+  const now = Date.now();
+  const next = Date.parse(shanghaiDateKey(now) + 'T00:00:00+08:00') + 86400000;
+  return Math.max(1, Math.ceil((next - now) / 1000));
+}
+
 const DIRECT_LINK_TOKEN_PREFIX = 'direct_link_token:';
 const DIRECT_LINK_PATH_PREFIX = 'direct_link_path:';
 function directLinkTokenKey(token = '') {
@@ -7821,6 +8107,7 @@ function normalizeDirectLinkRecord(data) {
     token,
     path,
     enabled: !!data.enabled,
+    dailyLimit: Math.max(0, Number(data.dailyLimit || 0) || 0),
     createdAt: String(data.createdAt || ''),
     updatedAt: String(data.updatedAt || '')
   };
@@ -7854,7 +8141,7 @@ async function enableDirectLink(env, path = '') {
   const existing = await getDirectLinkForPath(env, clean);
   if (existing && existing.enabled) return existing;
   const now = new Date().toISOString();
-  const record = { type: 'direct_link', token: crypto.randomUUID().replace(/-/g, ''), path: clean, enabled: true, createdAt: now, updatedAt: now };
+  const record = { type: 'direct_link', token: crypto.randomUUID().replace(/-/g, ''), path: clean, enabled: true, dailyLimit: existing?.dailyLimit || 0, createdAt: now, updatedAt: now };
   if (existing) await kvDelete(env, directLinkTokenKey(existing.token));
   await saveDirectLink(env, record);
   return record;
@@ -7872,10 +8159,45 @@ async function resetDirectLink(env, path = '') {
   if (!await getFileEntry(env, clean)) throw new Error('not found');
   const existing = await getDirectLinkForPath(env, clean);
   const now = new Date().toISOString();
-  const record = { type: 'direct_link', token: crypto.randomUUID().replace(/-/g, ''), path: clean, enabled: true, createdAt: now, updatedAt: now };
+  const record = { type: 'direct_link', token: crypto.randomUUID().replace(/-/g, ''), path: clean, enabled: true, dailyLimit: existing?.dailyLimit || 0, createdAt: now, updatedAt: now };
   if (existing) await kvDelete(env, directLinkTokenKey(existing.token));
   await saveDirectLink(env, record);
   return record;
+}
+async function setDirectLinkDailyLimit(env, path = '', dailyLimit = 0) {
+  const clean = assertVirtualPath(path);
+  const existing = await getDirectLinkForPath(env, clean);
+  if (!existing) throw new Error('direct link not enabled');
+  const updated = { ...existing, dailyLimit: parseDailyLimit(dailyLimit), updatedAt: new Date().toISOString() };
+  await kvPutJson(env, directLinkTokenKey(updated.token), updated);
+  return normalizeDirectLinkRecord(updated);
+}
+async function directLinkInfo(env, record) {
+  return {
+    enabled: !!record.enabled,
+    path: record.path,
+    url: record.enabled ? directLinkUrl(record) : '',
+    dailyLimit: record.dailyLimit || 0,
+    todayDownloads: await getDailyDownloadCount(env, 'direct', record.token),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt
+  };
+}
+async function listEnabledDirectLinks(env) {
+  const keys = await kvListKeys(env, DIRECT_LINK_TOKEN_PREFIX);
+  const out = [];
+  for (const key of keys) {
+    const record = normalizeDirectLinkRecord(await kvGetJson(env, key));
+    if (!record || !record.enabled || isNotesPath(record.path)) continue;
+    // 路径索引已指向别的 token（被重置过）的旧记录不算
+    const indexToken = await kvGetRaw(env, await directLinkPathKey(record.path));
+    if (indexToken !== record.token) continue;
+    const info = await directLinkInfo(env, record);
+    info.missing = !await getFileEntry(env, record.path);
+    out.push(info);
+  }
+  out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return out;
 }
 
 const OFFLINE_TASK_PREFIX = 'offline_task:';
@@ -8107,6 +8429,7 @@ async function createShare(env, body = {}) {
     expiresAt,
     maxAccesses: parseShareMaxAccesses(body.maxAccesses),
     accessCount: 0,
+    dailyLimit: parseDailyLimit(body.dailyLimit),
     createdAt: now,
     updatedAt: now
   };
@@ -8131,6 +8454,9 @@ async function updateShare(env, id, body = {}) {
 
   if (Object.prototype.hasOwnProperty.call(body, 'maxAccesses')) {
     updated.maxAccesses = parseShareMaxAccesses(body.maxAccesses);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'dailyLimit')) {
+    updated.dailyLimit = parseDailyLimit(body.dailyLimit);
   }
 
   if (body.passwordMode === 'clear') {
@@ -10980,6 +11306,8 @@ export default {
         return new Response(reason === 'access_limit' ? 'Share access limit reached' : 'Share expired', { status: 410 });
       }
       if (shareNeedsPassword(share) && !hasAccess) return new Response('Share password required', { status: 403 });
+      // 每日下载次数：分享页内下载和单独复制出去的下载直链都算
+      if (!await consumeDailyDownload(env, 'share', share.id, share.dailyLimit, request)) return dailyLimitResponse();
       // 无密码分享的直链：没有从分享页拿到的 cookie 就扣一次访问次数
       //   只在 GET 且是从头开始的请求时扣（断点续传 / 视频拖动的 Range 后续请求不重复扣）
       if (!shareNeedsPassword(share) && request.method === 'GET' && !hasViewCookie) {
@@ -11069,6 +11397,7 @@ export default {
           return new Response('Direct link closed or invalid', { status: 403 });
         }
         if (isNotesPath(record.path)) return new Response('Direct link closed or invalid', { status: 403 });
+        if (!await consumeDailyDownload(env, 'direct', record.token, record.dailyLimit, request)) return dailyLimitResponse();
         return storedVirtualFileResponse(request, R2, record.path, env, {
           filename: virtualPathName(record.path),
           contentType: getMimeType(record.path)
@@ -11225,7 +11554,7 @@ export default {
         const record = await getDirectLinkForPath(env, url.searchParams.get('path') || '');
         if (!record || !record.enabled || isNotesPath(record.path)) return jsonResponse({ enabled: false, url: '' });
         if (!await getFileEntry(env, record.path)) return jsonResponse({ enabled: false, url: '' });
-        return jsonResponse({ enabled: true, url: directLinkUrl(record), createdAt: record.createdAt });
+        return jsonResponse(await directLinkInfo(env, record));
       } catch (err) {
         return jsonResponse({ ok: false, error: err?.message || 'direct link failed' }, 400);
       }
@@ -11246,19 +11575,32 @@ export default {
           record = await resetDirectLink(env, pathParam);
         } else if (action === 'enable') {
           record = await enableDirectLink(env, pathParam);
+          if (Object.prototype.hasOwnProperty.call(body, 'dailyLimit')) record = await setDirectLinkDailyLimit(env, pathParam, body.dailyLimit);
+        } else if (action === 'limit') {
+          record = await setDirectLinkDailyLimit(env, pathParam, body.dailyLimit);
         } else {
           return jsonResponse({ ok: false, error: 'invalid action' }, 400);
         }
-        return jsonResponse({ enabled: true, url: directLinkUrl(record), createdAt: record.createdAt });
+        return jsonResponse(await directLinkInfo(env, record));
       } catch (err) {
         const message = err?.message || 'direct link failed';
         return jsonResponse({ ok: false, error: message }, message === 'not found' ? 404 : 400);
       }
     }
 
+    if (path === '/api/direct-links' && request.method === 'GET') {
+      try {
+        return jsonResponse({ links: await listEnabledDirectLinks(env) });
+      } catch (err) {
+        return jsonResponse({ ok: false, error: err?.message || 'direct links failed' }, 500);
+      }
+    }
+
     if (path === '/api/shares' && request.method === 'GET') {
       const shares = await listShares(env, url.searchParams.get('path') || '');
-      return jsonResponse({ shares: shares.filter(s => s && !isNotesPath(s.path)).map(publicShare).filter(Boolean) });
+      const list = shares.filter(s => s && !isNotesPath(s.path)).map(publicShare).filter(Boolean);
+      await Promise.all(list.map(async item => { item.todayDownloads = await getDailyDownloadCount(env, 'share', item.id); }));
+      return jsonResponse({ shares: list });
     }
 
     if (path === '/api/shares/refresh' && request.method === 'POST') {
